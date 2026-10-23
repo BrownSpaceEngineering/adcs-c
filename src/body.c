@@ -22,7 +22,7 @@ float PVD_ECEF[3] = {6.3761e6f, -0.1387e6f, 0.0807e6f};
 const float DETUMBLING_GYRO_THRESHOLD = 0.17f; // rad/s
 const float DETUMBLING_MAG_THRESHOLD = 0.01f;  // |dB/dt|, T/s. TODO: tune (anything in T/s passes)
 const float BDOT_GAIN = 1.0f;                  // TODO: tune (placeholder like the MATLAB k)
-float Imax[3] = {1, 1, 1};                     // TEMP
+const float* Imax = NULLPTR;                     // NULLPTR uses hardware defaults (see moments2currents.c)
 
 // Filter tuning. Measurement vectors are unit vectors, so R is in (unit vector)^2.
 // Initial bias variance and process noise follow simulink.m (Q there is per 0.1 s step).

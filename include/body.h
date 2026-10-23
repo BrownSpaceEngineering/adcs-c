@@ -10,7 +10,7 @@ extern float PVD_ECEF[3];
 extern const float DETUMBLING_MAG_THRESHOLD;
 extern const float DETUMBLING_GYRO_THRESHOLD;
 extern const float BDOT_GAIN;
-extern float Imax[3];
+extern const float* Imax;
 extern const float INIT_P[6 * 6];
 extern const float Q_RATE[6 * 6];
 extern const float R_IN_SUN[6 * 6];

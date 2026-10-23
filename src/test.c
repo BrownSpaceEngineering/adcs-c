@@ -1421,6 +1421,11 @@ void test_pd(void) {
     check_true(clamped, "torque saturates at +-PD_MAX_TAU");
 }
 
+// Magnetorquer constants from the hardware team (X, Y solid core; Z air core). Duplicated from
+// moments2currents.c on purpose: changing them there without updating here should fail.
+static const float MTQ_K[3] = {2.6f, 2.6f, 1.02f};         // A·m² per A
+static const float MTQ_IMAX[3] = {0.156f, 0.156f, 0.104f}; // A
+
 void test_torque_and_currents(void) {
     begin_suite("torque -> moment -> current");
     rng_seed(601);
@@ -1467,15 +1472,19 @@ void test_torque_and_currents(void) {
     float lim[3] = {1, 1, 1};
     float m_small[3] = {0.2f, -0.5f, 0.9f};
     moment2current3axis(m_small, lim, I);
-    check_vec_close("currents = moments for unit coil parameters", I, m_small, 3, 1e-7f);
+    float expected_small[3] = {m_small[0] / MTQ_K[0], m_small[1] / MTQ_K[1], m_small[2] / MTQ_K[2]};
+    check_vec_close("currents = m / k (k = 2.6 solid, 1.02 air)", I, expected_small, 3, 1e-7f);
     float m_big[3] = {5, -5, 0.5f};
     moment2current3axis(m_big, lim, I);
-    float expected[3] = {1, -1, 0.5f};
-    check_vec_close("currents saturate at +-Imax", I, expected, 3, 0);
-    float no_lim[3] = {-1, 2, -1};
+    float expected[3] = {1, -1, m_big[2] / MTQ_K[2]};
+    check_vec_close("currents saturate at +-Imax", I, expected, 3, 1e-7f);
+    float no_lim[3] = {-1, 1, -1};
     moment2current3axis(m_big, no_lim, I);
-    float expected2[3] = {5, -2, 0.5f};
-    check_vec_close("negative Imax means unlimited on that axis", I, expected2, 3, 0);
+    float expected2[3] = {m_big[0] / MTQ_K[0], -1, m_big[2] / MTQ_K[2]};
+    check_vec_close("negative Imax means unlimited on that axis", I, expected2, 3, 1e-7f);
+    moment2current3axis(m_big, NULL, I);
+    float expected3[3] = {MTQ_IMAX[0], -MTQ_IMAX[1], MTQ_IMAX[2]};
+    check_vec_close("NULL Imax clamps to hardware limits (0.156 solid, 0.104 air)", I, expected3, 3, 0);
 }
 
 // =============================================================================================
@@ -2078,10 +2087,11 @@ void test_body(void) {
     body_sim_init(&s);
     body_reset();
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
-    float expected[3];
+    float dipole[3], expected[3];
     for (int i = 0; i < 3; i++) {
-        expected[i] = -BDOT_GAIN * (mag[i] - mag_prev[i]) / 0.5f;
+        dipole[i] = -BDOT_GAIN * (mag[i] - mag_prev[i]) / 0.5f;
     }
+    moment2current3axis(dipole, Imax, expected);
     check_true(!body_is_pointing(), "tumbling in eclipse -> stays in detumble mode");
     check_vec_close("detumble output is the B-dot dipole (-k dB/dt) through the current model", currents, expected, 3, 1e-10f);
 
@@ -2128,7 +2138,7 @@ void test_body(void) {
         unsigned int cycle_tick = (unsigned int)k % BODY_MEASUREMENT_UPDATE_PERIOD_TICKS + 1u;
         finite &= all_finite(currents, 3);
         for (int i = 0; i < 3; i++) {
-            bounded &= fabsf(currents[i]) <= Imax[i];
+            bounded &= fabsf(currents[i]) <= MTQ_IMAX[i];
             any_nonzero |= !exactly(currents[i], 0);
             if (cycle_tick >= BODY_MAGNETORQUER_QUIET_START_TICK) {
                 quiet_window_ok &= exactly(currents[i], zero_moment_currents[i]);
@@ -2380,11 +2390,14 @@ static void parity_control(void) {
              "(air core, as in the C code) %s.",
              ML_M2C_RAW_ERROR, ML_M2C_FIX_APPLIED ? "added" : "(fix could not be applied!)");
     }
+    // The .m still uses unit coil parameters (I = m). Scale m by k so the C side divides back to the
+    // same unclamped current; this checks the clamp / no-limit behavior against MATLAB.
     worst = 0;
     for (int k = 0; k < ML_M2C_IN_N; k++) {
         float m[3], lim[3], I[3];
         to_float(&ML_M2C_IN[k][0], m, 3);
         to_float(&ML_M2C_IN[k][3], lim, 3);
+        for (int i = 0; i < 3; i++) m[i] *= MTQ_K[i];
         moment2current3axis(m, lim, I);
         worst = fmax(worst, max_abs_diff(I, ML_M2C_OUT[k], 3));
     }
