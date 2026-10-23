@@ -2087,10 +2087,11 @@ void test_body(void) {
     body_sim_init(&s);
     body_reset();
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
-    float expected[3];
+    float dipole[3], expected[3];
     for (int i = 0; i < 3; i++) {
-        expected[i] = -BDOT_GAIN * (mag[i] - mag_prev[i]) / 0.5f;
+        dipole[i] = -BDOT_GAIN * (mag[i] - mag_prev[i]) / 0.5f;
     }
+    moment2current3axis(dipole, Imax, expected);
     check_true(!body_is_pointing(), "tumbling in eclipse -> stays in detumble mode");
     check_vec_close("detumble output is the B-dot dipole (-k dB/dt) through the current model", currents, expected, 3, 1e-10f);
 
