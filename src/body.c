@@ -284,13 +284,15 @@ void body(const float* last_magnetometer_measurements, // 1x3
     float active_bstar = tle_bstar;
     double active_epoch_jd = tle_epoch_jd;
     if (posn_update != NULLPTR) {
-        // Validate the incoming TLE before adopting it
-        if (!all_finite(posn_update, 6)) return;
+        // Validate the incoming TLE before adopting it. Without its epoch the elements can't be
+        // placed in time (assuming "now" puts the satellite where it was at the real epoch), so
+        // a TLE with no metadata is rejected.
+        if (!tle_metadata_pending || !all_finite(posn_update, 6)) return;
         memcpy(new_tle, posn_update, sizeof(new_tle));
         if (!valid_tle_mean(new_tle)) return;
         active_tle = new_tle;
-        active_bstar = tle_metadata_pending ? pending_bstar : 0.0;
-        active_epoch_jd = tle_metadata_pending ? pending_epoch_jd : current_jd;
+        active_bstar = pending_bstar;
+        active_epoch_jd = pending_epoch_jd;
     } else if (!tle_initialized) {
         return; // No orbit to propagate yet.
     }

@@ -32,7 +32,7 @@ extern const float R_IN_SHADOW[3 * 3];
  *   gyro:         body frame, rad/s
  *   photodiodes:  NUM_DIODES raw readings in PHOTODIODES order
  *   posn_update:  TLE mean [n (rev/day), e, i, RAAN, argp, M (rad)] or NULLPTR to reuse the last TLE
- *                 Without metadata, a new TLE uses B* = 0 and the current Julian date as epoch.
+ *                 Call body_set_tle_metadata() first; a new TLE without metadata is rejected.
  *   unix_time / jd_scalar + jd_frac: the same instant, UTC
  *   output_currents: magnetorquer currents (A); always written when non-NULL
  *                    Zero-moment commands also pass through the current converter.

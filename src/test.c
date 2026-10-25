@@ -2087,6 +2087,9 @@ void test_body(void) {
     body_sim_init(&s);
     body_reset();
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+    check_vec_close("TLE without metadata (epoch, B*) is rejected -> zero currents", currents, zero, 3, 0);
+    body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
+    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
     float dipole[3], expected[3];
     for (int i = 0; i < 3; i++) {
         dipole[i] = -BDOT_GAIN * (mag[i] - mag_prev[i]) / 0.5f;
@@ -2245,6 +2248,7 @@ void test_body(void) {
     // Position is propagated internally when no update is given
     body_reset();
     body_sim_init(&s);
+    body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 1.0f, currents);
     body(mag_prev, mag, gyro, diodes_dark, NULLPTR, s.unix_time + 1, s.jd_int, (float)s.jd_frac, 1.0f, currents);
     check_true(all_finite(currents, 3) && !body_is_pointing(), "propagating without a position update works");
