@@ -2081,6 +2081,26 @@ void test_body(void) {
     body(mag_prev, mag, gyro, diodes_dark, NULLPTR, 1767225600, 2461041, 0.5f, 1.0f, currents);
     check_vec_close("no position yet -> zero currents (and currents are always written)", currents, zero, 3, 0);
     check_true(!body_is_pointing(), "no position yet -> not pointing");
+    {
+        float tle_out[6], r_out[3], bstar_out;
+        double epoch_out;
+        check_true(!body_get_tle(tle_out, &bstar_out, &epoch_out), "no TLE yet -> body_get_tle returns false");
+        check_true(!body_get_position(r_out), "no position yet -> body_get_position returns false");
+
+        body_sim_t getter_sim;
+        body_sim_init(&getter_sim);
+        body_reset();
+        body_set_tle_metadata(getter_sim.tle_bstar, getter_sim.tle_epoch_jd);
+        body(mag_prev, mag, gyro, diodes_dark, getter_sim.tle_mean, getter_sim.unix_time, getter_sim.jd_int,
+             (float)getter_sim.jd_frac, 0.5f, currents);
+        check_true(body_get_tle(tle_out, &bstar_out, &epoch_out), "committed TLE -> body_get_tle returns true");
+        check_true(memcmp(tle_out, getter_sim.tle_mean, sizeof(tle_out)) == 0, "body_get_tle returns the committed elements");
+        check_true(memcmp(&epoch_out, &getter_sim.tle_epoch_jd, sizeof(epoch_out)) == 0, "body_get_tle returns the committed epoch");
+        check_true(body_get_position(r_out) && l2_norm(r_out, 3) > 6.0e6f, "body_get_position returns an orbital radius (m)");
+        body_reset();
+        check_true(!body_get_tle(tle_out, &bstar_out, &epoch_out), "body_reset clears the TLE");
+        check_true(!body_get_position(r_out), "body_reset clears the position");
+    }
 
     // Detumbling: fast spin, eclipse -> B-dot
     body_sim_t s;
