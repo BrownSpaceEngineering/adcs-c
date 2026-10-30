@@ -58,4 +58,8 @@ void body_get_gyro_bias(float* bias);
 int body_get_filter_resets(void);
 /* Apply B* and UTC epoch to the next non-NULL posn_update; consumed once. */
 bool body_set_tle_metadata(float bstar, double epoch_jd);
+// The TLE body() last committed (mean elements in posn_update order); returns false if there isn't one yet
+bool body_get_tle(float* tle_mean_out, float* bstar, double* epoch_jd);
+// ECI position (m) from the last successful propagation; returns false if there hasn't been one yet
+bool body_get_position(float* r_eci_m);
 #endif

@@ -72,6 +72,8 @@ static float tle_mean[6];
 static float tle_bstar;
 static double tle_epoch_jd;
 static float pending_bstar;
+static float last_r_eci[3];
+static bool position_valid = false;
 static double pending_epoch_jd;
 static bool tle_metadata_pending = false;
 static float estimated_quat[4];
@@ -107,6 +109,8 @@ void body_reset(void) {
     q_want_prev[3] = 0.0f;
     pointing = false;
     tle_initialized = false;
+    position_valid = false;
+    memset(last_r_eci, 0, sizeof(last_r_eci));
     attitude_initialized = false;
     filter_resets = 0;
     innovation_strikes = 0;
@@ -120,6 +124,24 @@ bool body_set_tle_metadata(float bstar, double epoch_jd) {
     pending_bstar = bstar;
     pending_epoch_jd = epoch_jd;
     tle_metadata_pending = true;
+    return true;
+}
+
+bool body_get_tle(float* tle_mean_out, float* bstar, double* epoch_jd) {
+    if (!tle_initialized) {
+        return false;
+    }
+    memcpy(tle_mean_out, tle_mean, sizeof(tle_mean));
+    *bstar = tle_bstar;
+    *epoch_jd = tle_epoch_jd;
+    return true;
+}
+
+bool body_get_position(float* r_eci_m) {
+    if (!position_valid) {
+        return false;
+    }
+    memcpy(r_eci_m, last_r_eci, sizeof(last_r_eci));
     return true;
 }
 
@@ -321,6 +343,8 @@ void body(const float* last_magnetometer_measurements, // 1x3
         tle_initialized = true;
         tle_metadata_pending = false;
     }
+    memcpy(last_r_eci, r_eci, sizeof(last_r_eci));
+    position_valid = true;
 
     // Expected magnetometer reading (T, ECI)
     float expected_mag[3];
