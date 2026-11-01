@@ -1,6 +1,7 @@
 #include "include/body.h"
 #include "arm_math.h"
 #include "include/bdot.h"
+#include "include/closest_approach.h"
 #include "include/down_quat.h"
 #include "include/ecef2eci.h"
 #include "include/iterate.h"
@@ -19,6 +20,9 @@
 
 // Providence, lla2ecef(41.825226, -71.418884, 0) (see eceftoeci.m)
 float PVD_ECEF[3] = {6.3761e6f, -0.1387e6f, 0.0807e6f};
+// Pointing mode, set from outside (e.g. FSW on a ground command): true holds the fixed inertial
+// line of sight from closest_approach(), false tracks Providence. body_reset() leaves it alone.
+bool FIXED = false;
 const float DETUMBLING_GYRO_THRESHOLD = 0.17f; // rad/s
 const float DETUMBLING_MAG_THRESHOLD = 0.01f;  // |dB/dt|, T/s. TODO: tune (anything in T/s passes)
 const float BDOT_GAIN = 1.0f;                  // TODO: tune (placeholder like the MATLAB k)
@@ -66,6 +70,9 @@ const float R_IN_SHADOW[3 * 3] = {
 #define MAX_INNOVATION_STRIKES 5
 // A rate above this while pointing indicates a new tumble or a gyro fault.
 #define MAX_POINTING_RATE_RAD_S 1.0f
+// Distance (m) to the virtual target along the closest-approach line of sight; any large
+// positive number works
+#define VIRTUAL_TARGET_DIST_M 1e7f
 
 // ---- Module state (previously `static` in body.h, which gave every includer its own copy) ----
 static float tle_mean[6];
@@ -81,6 +88,9 @@ static float estimated_gyro_bias[3];
 static float error_quat_state[6];
 static float error_quat_cov[6 * 6];
 static float q_want_prev[4] = {1, 0, 0, 0};
+// Fixed pointing target from closest_approach(), recomputed on each new TLE
+static float pass_los_eci[3];
+static bool pass_valid = false;
 
 static bool pointing = false;
 static bool tle_initialized = false;
@@ -107,6 +117,8 @@ void body_reset(void) {
     q_want_prev[1] = 0.0f;
     q_want_prev[2] = 0.0f;
     q_want_prev[3] = 0.0f;
+    memset(pass_los_eci, 0, sizeof(pass_los_eci));
+    pass_valid = false;
     pointing = false;
     tle_initialized = false;
     position_valid = false;
@@ -342,6 +354,12 @@ void body(const float* last_magnetometer_measurements, // 1x3
         tle_epoch_jd = active_epoch_jd;
         tle_initialized = true;
         tle_metadata_pending = false;
+        // New TLE: find the next 24 h's closest approach to Providence and hold that line of
+        // sight as the pointing target until the next uplink
+        double t_star;
+        float rho_min;
+        pass_valid = closest_approach(tle_mean, tle_bstar, tle_epoch_jd, seconds_since_epoch,
+                                      PVD_ECEF, pass_los_eci, &t_star, &rho_min);
     }
     memcpy(last_r_eci, r_eci, sizeof(last_r_eci));
     position_valid = true;
@@ -486,15 +504,23 @@ void body(const float* last_magnetometer_measurements, // 1x3
     }
 
     // ---- Control: pointing_error.m -> PD_loop.m -> torque2moment3axis.m -> moment2current3axis.m
-    // Target ground location in ECI
-    float pvd_eci[3];
-    ecef_2_eci(PVD_ECEF, pvd_eci, unix_time);
-
     // Body-frame error quaternion. (The old code used goal * est^-1, an ECI-frame error, and
     // fed it to a controller that works in body coordinates.)
     float q_err[4];
+    float target_eci[3];
+    if (FIXED && pass_valid) {
+        // Virtual target along the closest-approach line of sight u computed when the TLE
+        // arrived: target = r + D*u, so target - r = D*u and the boresight holds a fixed inertial
+        // direction
+        for (int i = 0; i < 3; i++) {
+            target_eci[i] = r_eci[i] + VIRTUAL_TARGET_DIST_M * pass_los_eci[i];
+        }
+    } else {
+        // Fixed mode off, or no pass found: track Providence directly
+        ecef_2_eci(PVD_ECEF, target_eci, unix_time);
+    }
     // No valid pointing solution: coast with the coils off
-    if (!pointing_error(r_eci, v_eci, estimated_quat, pvd_eci, q_want_prev, q_err, NULLPTR)) {
+    if (!pointing_error(r_eci, v_eci, estimated_quat, target_eci, q_want_prev, q_err, NULLPTR)) {
         command_zero_moment(output_currents);
         return;
     }

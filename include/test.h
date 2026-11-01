@@ -26,6 +26,7 @@ void test_photodiodes(void);
 void test_pointing(void);
 void test_filters(void);
 void test_body(void);
+void test_closest_approach(void);
 // Compares against include/matlab_reference.h (tools/matlab/generate_matlab_reference.m)
 void test_matlab_parity(void);
 #endif

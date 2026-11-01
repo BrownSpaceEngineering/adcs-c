@@ -4,6 +4,7 @@
 #include "arm_math.h"
 #include "include/bdot.h"
 #include "include/body.h"
+#include "include/closest_approach.h"
 #include "include/down_quat.h"
 #include "include/ecef2eci.h"
 #include "include/filters.h"
@@ -282,6 +283,7 @@ int test_run_all(void) {
     test_pointing();
     test_filters();
     test_body();
+    test_closest_approach();
     test_matlab_parity();
 
     printf("\n===== SUMMARY =====\n");
@@ -2781,4 +2783,239 @@ void test_matlab_parity(void) {
     parity_magnetosphere();
     parity_pointing();
     parity_ukf();
+}
+
+// =============================================================================================
+// Closest approach (closest_approach.c) vs a line-by-line double-precision transcription of
+// closest_approach.m. Both sides use the C SGP4 (sgp4_step), so this checks the port of the
+// search, the GMST rotation and the Providence model, not SGP4 itself.
+// =============================================================================================
+
+// Defined in body.c (not declared in body.h); FSW sets it to choose fixed pointing
+extern bool FIXED;
+
+#define ML_CA_DT 10.0      // DT in closest_approach.m
+#define ML_CA_TWIN 86400.0 // TWIN in closest_approach.m
+
+// gmst() in closest_approach.m (rad)
+static double ml_gmst(double jd) {
+    double d = jd - 2451545.0;
+    double T = d / 36525.0;
+    double deg = 280.46061837 + 360.98564736629 * d + 0.000387933 * T * T - T * T * T / 38710000.0;
+    deg = fmod(deg, 360.0);
+    if (deg < 0) deg += 360.0;
+    return deg * M_PI / 180.0;
+}
+
+// providenceECEF() in closest_approach.m (m)
+static void ml_providence_ecef(double* r) {
+    double lat = 41.82 * M_PI / 180.0, lon = -71.41 * M_PI / 180.0, h = 0;
+    double a = 6378137.0, f = 1 / 298.257223563, e2 = f * (2 - f);
+    double N = a / sqrt(1 - e2 * sin(lat) * sin(lat));
+    r[0] = (N + h) * cos(lat) * cos(lon);
+    r[1] = (N + h) * cos(lat) * sin(lon);
+    r[2] = (N * (1 - e2) + h) * sin(lat);
+}
+
+// closest_approach.m's input conversion: [a (km), e, i, RAAN, argp, nu (rad)] -> SGP4 mean
+// elements [n (rev/day), e, i, RAAN, argp, M (rad)]
+static void ml_mean_elements(const double* el, float* oe) {
+    double mu = 398600.8, a = el[0], e = el[1], nu = el[5];
+    double E = 2 * atan2(sqrt(1 - e) * sin(nu / 2), sqrt(1 + e) * cos(nu / 2));
+    double M = fmod(E - e * sin(E), 2 * M_PI);
+    if (M < 0) M += 2 * M_PI;
+    double n = sqrt(mu / (a * a * a)) * 86400 / (2 * M_PI);
+    double out[6] = {n, e, el[2], el[3], el[4], M};
+    to_float(out, oe, 6);
+}
+
+// rangeAt() in closest_approach.m. Returns NaN (u zeroed) if SGP4 fails.
+static double ml_range_at(double t, const float* oe, float bstar, double epoch_jd, const double* prov, double* u) {
+    float r_km[3], v_km_s[3], oe_osc[7];
+    if (sgp4_step(oe, bstar, epoch_jd, (float)t, r_km, v_km_s, oe_osc) != 0) {
+        if (u != NULL) u[0] = u[1] = u[2] = 0;
+        return NAN;
+    }
+    double th = ml_gmst(epoch_jd + t / 86400.0), c = cos(th), s = sin(th);
+    double r_prov[3] = {c * prov[0] - s * prov[1], s * prov[0] + c * prov[1], prov[2]};
+    double d[3];
+    for (int i = 0; i < 3; i++) {
+        d[i] = r_prov[i] - (double)r_km[i] * 1000.0;
+    }
+    double rho = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (u != NULL) {
+        for (int i = 0; i < 3; i++) {
+            u[i] = d[i] / rho;
+        }
+    }
+    return rho;
+}
+
+// closest_approach.m's search (without the persistent cache)
+static bool ml_closest_approach(const float* oe, float bstar, double epoch_jd, double t0, const double* prov,
+                                double* u, double* t_star, double* rho_min) {
+    int N = (int)floor(ML_CA_TWIN / ML_CA_DT) + 1;
+    double best_rho = INFINITY, best_t = t0;
+    bool best_ok = false;
+    for (int k = 1; k <= N; k++) {
+        double t = t0 + (k - 1) * ML_CA_DT;
+        double r = ml_range_at(t, oe, bstar, epoch_jd, prov, NULL);
+        if (!isnan(r) && r < best_rho) {
+            best_rho = r;
+            best_t = t;
+            best_ok = true;
+        }
+    }
+    u[0] = u[1] = u[2] = 0;
+    if (best_ok) {
+        double ta = fmax(best_t - ML_CA_DT, t0), tb = best_t + ML_CA_DT;
+        for (double t = ta; t <= tb; t += 1.0) {
+            double r = ml_range_at(t, oe, bstar, epoch_jd, prov, NULL);
+            if (!isnan(r) && r < best_rho) {
+                best_rho = r;
+                best_t = t;
+            }
+        }
+        ml_range_at(best_t, oe, bstar, epoch_jd, prov, u);
+    }
+    *t_star = best_t;
+    *rho_min = best_rho;
+    return best_ok;
+}
+
+// Reaches pointing like test_body's sunlit case, then runs `ticks` more steps with FIXED = fixed
+static void fixed_mode_run(bool fixed, int ticks, float* currents) {
+    body_sim_t s;
+    rng_seed(901);
+    body_sim_init(&s);
+    s.omega[0] = 0.002f;
+    s.omega[1] = -0.001f;
+    s.omega[2] = 0.0015f;
+    s.gyro_bias[0] = 0.001f;
+    s.gyro_bias[1] = -0.0005f;
+    s.gyro_bias[2] = 0.0008f;
+    body_reset();
+    FIXED = fixed;
+    float m0[3], g0[3], d0[NUM_DIODES];
+    body_sim_sensors(&s, true, m0, g0, d0);
+    memcpy(s.last_mag, m0, sizeof(m0));
+    for (int k = 0; k <= ticks; k++) {
+        body_sim_step(&s, true, 1, currents);
+    }
+}
+
+void test_closest_approach(void) {
+    begin_suite("closest approach (closest_approach.m)");
+    double prov_d[3];
+    ml_providence_ecef(prov_d);
+    float prov_f[3];
+    to_float(prov_d, prov_f, 3);
+
+    // MATLAB inputs: a (km), e, i, RAAN, argp, nu (deg), B*, epoch (unix), window start t0 (s since epoch)
+    static const double cases[][9] = {
+        {6778.0, 0.0005, 51.6, 40.0, 10.0, 30.0, 0.0, 1767225600, 0.0},    // ISS-like
+        {6928.0, 0.001, 97.5, 120.0, 90.0, 200.0, 1e-4, 1767225600, 0.0}, // sun-synchronous, with drag
+        {7078.0, 0.02, 65.0, 300.0, 45.0, 0.0, 0.0, 1780000000, 3600.5},  // eccentric, window after epoch
+        {6878.0, 0.0, 30.0, 0.0, 0.0, 0.0, 0.0, 1790000000, 12345.0},     // never overflies Providence
+    };
+    int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    float oe0[6] = {0}, u0[3] = {0}, rho0 = 0;
+    double t_star0 = 0, epoch0 = 0;
+    double w_t = 0, w_u = 0, w_rho = 0;
+    bool all_ok = true, unit_ok = true, window_ok = true;
+    for (int k = 0; k < n_cases; k++) {
+        const double* c = cases[k];
+        double el[6] = {c[0], c[1], c[2] * M_PI / 180.0, c[3] * M_PI / 180.0, c[4] * M_PI / 180.0,
+                        c[5] * M_PI / 180.0};
+        float oe[6];
+        ml_mean_elements(el, oe);
+        double epoch_jd = unix_2_jd(c[7]), t0 = c[8];
+
+        float u[3], rho;
+        double t_star;
+        bool ok = closest_approach(oe, (float)c[6], epoch_jd, t0, prov_f, u, &t_star, &rho);
+        double u_ml[3], t_ml, rho_ml;
+        bool ok_ml = ml_closest_approach(oe, (float)c[6], epoch_jd, t0, prov_d, u_ml, &t_ml, &rho_ml);
+
+        all_ok &= ok && ok_ml;
+        unit_ok &= fabs(l2_norm(u, 3) - 1.0) < 1e-6;
+        window_ok &= t_star >= t0 && t_star <= t0 + CLOSEST_APPROACH_WINDOW_S + CLOSEST_APPROACH_DT_COARSE_S;
+        w_t = fmax(w_t, fabs(t_star - t_ml));
+        w_u = fmax(w_u, vec_angle_deg_d(u, u_ml));
+        w_rho = fmax(w_rho, fabs(rho - rho_ml));
+        if (k == 0) {
+            memcpy(oe0, oe, sizeof(oe0));
+            memcpy(u0, u, sizeof(u0));
+            t_star0 = t_star;
+            rho0 = rho;
+            epoch0 = epoch_jd;
+        }
+    }
+    check_true(all_ok, "C and closest_approach.m both find a closest approach in every case");
+    // Equal ranges one second apart (minimum exactly between two samples) may break either way
+    check_less("closest approach time == closest_approach.m (s)", w_t, 1.0 + 1e-9);
+    check_less("line of sight u == closest_approach.m (deg)", w_u, 1e-3);
+    check_less("range at closest approach == closest_approach.m (m)", w_rho, 2.0);
+    check_true(unit_ok, "line of sight is a unit vector");
+    check_true(window_ok, "closest approach is inside [t0, t0 + 24 h]");
+
+    // Independent of the coarse/fine search: every second of case 0's window
+    double bf_rho = INFINITY, bf_t = 0;
+    for (int t = 0; t <= (int)ML_CA_TWIN; t++) {
+        double r = ml_range_at(t, oe0, 0.0f, epoch0, prov_d, NULL);
+        if (!isnan(r) && r < bf_rho) {
+            bf_rho = r;
+            bf_t = t;
+        }
+    }
+    check_close("closest approach time == 1 s brute force over 24 h (s)", t_star0, bf_t, 1.0);
+    check_less("closest approach range - 1 s brute-force minimum (m)", rho0 - bf_rho, 2.0);
+    double u_bf[3];
+    ml_range_at(t_star0, oe0, 0.0f, epoch0, prov_d, u_bf);
+    check_less("u == satellite -> Providence at t* (deg)", vec_angle_deg_d(u0, u_bf), 1e-3);
+
+    // Window starts at t0, not at the epoch
+    float u[3], rho;
+    double t_star, t0_late = t_star0 + 600.0;
+    bool ok = closest_approach(oe0, 0.0f, epoch0, t0_late, prov_f, u, &t_star, &rho);
+    check_true(ok && t_star >= t0_late, "search never looks before the window start");
+
+    float zero[3] = {0, 0, 0};
+    ok = closest_approach(oe0, 0.0f, epoch0, NAN, prov_f, u, &t_star, &rho);
+    check_true(!ok, "NaN window start is rejected");
+    check_vec_close("rejected search zeroes u", u, zero, 3, 0);
+
+    // body.c searches with PVD_ECEF (41.825226 N, -71.418884 E, rounded to 4 significant figures),
+    // not closest_approach.m's providenceECEF() (41.82 N, -71.41 E)
+    double dp[3] = {PVD_ECEF[0] - prov_d[0], PVD_ECEF[1] - prov_d[1], PVD_ECEF[2] - prov_d[2]};
+    closest_approach(oe0, 0.0f, epoch0, 0.0, PVD_ECEF, u, &t_star, &rho);
+    note("PVD_ECEF is %.0f m from providenceECEF(); u differs by %.3f deg in case 0",
+         sqrt(dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]), RAD2DEG(vec_angle(u, u0)));
+
+    // body.c's virtual target r + D*u (D = VIRTUAL_TARGET_DIST_M = 1e7 m) makes pointing_error aim
+    // along u despite float rounding
+    float r[3] = {6.9e6f, -1.3e6f, 2.2e6f}, v[3] = {-1500, 2000, 7000}, target[3];
+    float id[4] = {1, 0, 0, 0}, prev[4] = {1, 0, 0, 0}, q_err[4], z_want[3];
+    for (int i = 0; i < 3; i++) {
+        target[i] = r[i] + 1e7f * u0[i];
+    }
+    ok = pointing_error(r, v, id, target, prev, q_err, z_want);
+    check_true(ok, "virtual target r + D*u gives a pointing solution");
+    check_less("virtual target r + D*u: boresight == u (deg)", RAD2DEG(vec_angle(z_want, u0)), 1e-4);
+
+    // FIXED selects the pointing target in body(); it is a command, so body_reset() keeps it
+    float cur_track[3], cur_fixed[3];
+    fixed_mode_run(false, 50, cur_track);
+    bool track_pointing = body_is_pointing();
+    fixed_mode_run(true, 50, cur_fixed);
+    check_true(track_pointing && body_is_pointing(), "pointing holds with FIXED off and on");
+    check_true(all_finite(cur_fixed, 3), "FIXED: currents are finite");
+    check_true(!exactly(cur_fixed[0], cur_track[0]) || !exactly(cur_fixed[1], cur_track[1])
+                   || !exactly(cur_fixed[2], cur_track[2]),
+               "FIXED changes the commanded currents (different target)");
+    body_reset();
+    check_true(FIXED, "body_reset() leaves FIXED alone");
+    FIXED = false;
+    body_reset();
 }
