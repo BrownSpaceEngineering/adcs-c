@@ -18,7 +18,7 @@ list(FILTER SRC EXCLUDE REGEX "/Source/[^/]+/arm_[^/]*\\.c$")
 # not standalone translation units, and fail to compile on their own
 list(FILTER SRC EXCLUDE REGEX "/_[^/]*\\.c$")
 # manual specified sources:
-set(ADCS_SRC src/main.c src/test.c src/quat.c src/laextension.c src/bdot.c src/body.c src/pointing_error.c src/ecef2eci.c src/filters.c src/iterate.c src/kepler.c src/magnetosphere.c src/moments2currents.c src/orbital2eci.c src/pd.c src/photodiode_determination.c src/quest.c src/sunvec.c src/torque2moments.c src/sgp4_init.c src/sgp4_propagate.c src/sgp4_step.c)
+set(ADCS_SRC src/main.c src/test.c src/quat.c src/laextension.c src/bdot.c src/body.c src/pointing_error.c src/ecef2eci.c src/filters.c src/iterate.c src/kepler.c src/magnetosphere.c src/moments2currents.c src/orbital2eci.c src/pd.c src/photodiode_determination.c src/quest.c src/sunvec.c src/torque2moments.c src/sgp4_init.c src/sgp4_propagate.c src/sgp4_step.c src/newpointing.c)
 list(APPEND SRC ${ADCS_SRC})
 # extra warnings on our own code only (CMSIS is noisy). -Wshadow / -Wfloat-equal match the PVDX
 # firmware build, which compiles with -Werror.

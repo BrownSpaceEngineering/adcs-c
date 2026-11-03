@@ -123,14 +123,14 @@ bool all_finite(const float32_t* A, int n) {
 }
 
 /**
- * \fn eye
+ * \fn eye_f32
  *
  * \brief Fills a square matrix with the identity matrix
  *
  * \param[out] A: Square matrix to fill, n x n
  * \param[in] n: Size of the matrix
  */
-void eye(float32_t* A, int n) {
+void eye_f32(float32_t* A, int n) {
     for (int i = 0; i < n * n; i++) {
         A[i] = 0.0f;
     }

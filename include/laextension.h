@@ -12,5 +12,6 @@ float32_t l2_norm(const float32_t* A, int size);
 // Normalizes a vector in place; returns false (and leaves it untouched) if its norm is ~0
 bool normalize_vec(float32_t* A, int size);
 bool all_finite(const float32_t* A, int size);
-void eye(float32_t* A, int n);
+// Not "eye": PVDXos's src/linalg already defines a global eye()
+void eye_f32(float32_t* A, int n);
 #endif

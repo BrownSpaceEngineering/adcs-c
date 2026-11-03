@@ -10,11 +10,19 @@ extern float PVD_ECEF[3];
 extern const float DETUMBLING_MAG_THRESHOLD;
 extern const float DETUMBLING_GYRO_THRESHOLD;
 extern const float BDOT_GAIN;
-extern float Imax[3];
+extern const float* Imax;
 extern const float INIT_P[6 * 6];
 extern const float Q_RATE[6 * 6];
 extern const float R_IN_SUN[6 * 6];
 extern const float R_IN_SHADOW[3 * 3];
+
+/* Update on tick 100; allow the magnetorquers to settle on ticks 95-100. */
+#define BODY_MEASUREMENT_UPDATE_PERIOD_TICKS 100u
+#define BODY_MAGNETORQUER_QUIET_START_TICK 95u
+#if BODY_MAGNETORQUER_QUIET_START_TICK < 1u \
+    || BODY_MAGNETORQUER_QUIET_START_TICK > BODY_MEASUREMENT_UPDATE_PERIOD_TICKS
+#error "Magnetorquer quiet start must be within the measurement cycle"
+#endif
 
 /**
  * One ADCS step.
@@ -23,9 +31,11 @@ extern const float R_IN_SHADOW[3 * 3];
  *   magnetometer: body frame, TESLA (same units as the WMM model and torque_2_moments)
  *   gyro:         body frame, rad/s
  *   photodiodes:  NUM_DIODES raw readings in PHOTODIODES order
- *   posn_update:  [a (m), e, i, RAAN, argp, nu (deg)] or NULLPTR to propagate the last one
+ *   posn_update:  TLE mean [n (rev/day), e, i, RAAN, argp, M (rad)] or NULLPTR to reuse the last TLE
+ *                 Call body_set_tle_metadata() first; a new TLE without metadata is rejected.
  *   unix_time / jd_scalar + jd_frac: the same instant, UTC
- *   output_currents: magnetorquer currents (A); always written (zeros when idle)
+ *   output_currents: magnetorquer currents (A); always written when non-NULL
+ *                    Zero-moment commands also pass through the current converter.
  */
 void body(const float* last_magnetometer_measurements, // 1x3
           const float* magnetometer_measurements,      // 1x3
@@ -46,4 +56,10 @@ bool body_get_attitude(float* q_body_to_eci);
 void body_get_gyro_bias(float* bias);
 // Number of times the filter has been declared failed and reset to detumbling
 int body_get_filter_resets(void);
+/* Apply B* and UTC epoch to the next non-NULL posn_update; consumed once. */
+bool body_set_tle_metadata(float bstar, double epoch_jd);
+// The TLE body() last committed (mean elements in posn_update order); returns false if there isn't one yet
+bool body_get_tle(float* tle_mean_out, float* bstar, double* epoch_jd);
+// ECI position (m) from the last successful propagation; returns false if there hasn't been one yet
+bool body_get_position(float* r_eci_m);
 #endif
