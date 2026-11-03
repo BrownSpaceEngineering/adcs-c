@@ -17,6 +17,7 @@
 #include "include/torque2moments.h"
 #include "math.h"
 #include "string.h"
+#include <limits.h>
 
 // Providence, lla2ecef(41.825226, -71.418884, 0) (see eceftoeci.m)
 float PVD_ECEF[3] = {6.3761e6f, -0.1387e6f, 0.0807e6f};
@@ -89,6 +90,7 @@ static bool attitude_initialized = false;
 static int filter_resets = 0;
 static int innovation_strikes = 0;
 static unsigned int pointing_tick = 0;
+static unsigned int mag_fault_ticks = 0; // consecutive ticks with an unusable magnetometer sample
 
 static const float ZERO3[3] = {0, 0, 0};
 
@@ -116,6 +118,7 @@ void body_reset(void) {
     filter_resets = 0;
     innovation_strikes = 0;
     pointing_tick = 0;
+    mag_fault_ticks = 0;
 }
 
 bool body_set_tle_metadata(float bstar, double epoch_jd) {
@@ -173,6 +176,7 @@ static void reset_filter_to_detumble(void) {
     pointing = false;
     innovation_strikes = 0;
     pointing_tick = 0;
+    mag_fault_ticks = 0;
     filter_resets++;
 }
 
@@ -281,26 +285,28 @@ void body(const float* last_magnetometer_measurements, // 1x3
     if (output_currents != NULLPTR) zero_currents(output_currents);
     else return;
 
-    // Bad magnetometer data: drop back to detumbling and bail
-
-    //TO CHANGE: DON'T RESET: JUST COMMAND 0 MOMENT BUT PRESERVE FILTER
-
-    if (!mag_ok(last_magnetometer_measurements) || !mag_ok(magnetometer_measurements)) {
-        if (pointing) reset_filter_to_detumble();
-        return;
-    }
     // Bail on null pointers, bad dt, or non-finite gyro
-    if (output_currents == NULLPTR || gyro_measurements == NULLPTR
-        || photodiode_measurements == NULLPTR || !(dt > 0.0f)
+    if (gyro_measurements == NULLPTR || photodiode_measurements == NULLPTR || !(dt > 0.0f)
         || !isfinite(dt) || !all_finite(gyro_measurements, 3)) {
         return;
     }
 
-    // Unit-vector the measured field; a zero-length reading is unusable
-    float mag_body_unit[3] = {magnetometer_measurements[0], magnetometer_measurements[1],
-                              magnetometer_measurements[2]};
-    if (!normalize_vec(mag_body_unit, 3)) {
-        if (pointing) reset_filter_to_detumble();
+    // Magnetometer health. While pointing only the current sample matters (the previous one is
+    // only used by B-dot / ready_to_point), and a bad sample is tolerated: the filter coasts on
+    // the gyro and control uses the WMM field. Only a persistent fault resets the filter.
+    float mag_body_unit[3] = {0.0f, 0.0f, 0.0f};
+    bool mag_valid = mag_ok(magnetometer_measurements);
+    if (mag_valid) {
+        memcpy(mag_body_unit, magnetometer_measurements, sizeof(mag_body_unit));
+        mag_valid = normalize_vec(mag_body_unit, 3);
+    }
+    if (mag_valid) {
+        mag_fault_ticks = 0;
+    } else if (mag_fault_ticks < UINT_MAX) {
+        mag_fault_ticks++;
+    }
+    if (pointing && mag_fault_ticks >= BODY_MAG_FAULT_RESET_TICKS) {
+        reset_filter_to_detumble();
         return;
     }
 
@@ -369,6 +375,9 @@ void body(const float* last_magnetometer_measurements, // 1x3
 
     // During detumbling...
     if (!pointing) {
+        // B-dot and ready_to_point need both samples; no filter state to lose by skipping a tick
+        if (!mag_valid || !mag_ok(last_magnetometer_measurements)) return;
+
         // Case 1: Measurements tell us to stop detumbling
         if (ready_to_point(photodiode_measurements, gyro_measurements,
                            last_magnetometer_measurements, magnetometer_measurements, dt)) {
@@ -430,8 +439,8 @@ void body(const float* last_magnetometer_measurements, // 1x3
     float ref_vecs[6] = {mag_ref_unit[0], mag_ref_unit[1], mag_ref_unit[2], 0, 0, 0};
     int num_vecs;
     const float* R;
-    if (!do_update) {
-        num_vecs = 0; // scheduled gyro propagation between measurement ticks
+    if (!do_update || !mag_valid) {
+        num_vecs = 0; // gyro propagation only (between measurement ticks, or a bad magnetometer)
         R = NULLPTR;
     } else if (in_sun) {
         // Sunlit: use both magnetometer and sun vectors

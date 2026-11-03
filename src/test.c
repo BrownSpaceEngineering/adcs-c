@@ -2047,6 +2047,21 @@ static void body_sim_step(body_sim_t* s, bool sunlit, int dt_s, float* currents)
     memcpy(s->last_mag, mag, sizeof(mag));
 }
 
+// One sunlit body() call with the current and/or previous magnetometer sample replaced (either
+// may be NULLPTR). The good reading is still recorded as last_mag, so the next normal step sees a
+// valid previous sample.
+static void body_sim_bad_mag_step(body_sim_t* s, const float* bad_current, const float* bad_previous,
+                                  bool replace_current, bool replace_previous, float* currents) {
+    body_sim_advance(s, 1);
+    float mag[3], gyro[3], diodes[NUM_DIODES];
+    body_sim_sensors(s, true, mag, gyro, diodes);
+    const float* current = replace_current ? bad_current : mag;
+    const float* previous = replace_previous ? bad_previous : s->last_mag;
+    body(previous, current, gyro, diodes, NULLPTR, s->unix_time, s->jd_int, (float)s->jd_frac,
+         1.0f, currents);
+    memcpy(s->last_mag, mag, sizeof(mag));
+}
+
 static float body_attitude_error_deg(const body_sim_t* s) {
     float q[4];
     body_get_attitude(q);
@@ -2107,6 +2122,7 @@ void test_body(void) {
     float nan_mag[3] = {NAN, 0, 0};
     body(mag_prev, nan_mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
     check_vec_close("NaN magnetometer -> zero currents", currents, zero, 3, 0);
+    check_true(body_get_filter_resets() == 0, "bad magnetometer while detumbling -> no filter reset");
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.0f, currents);
     check_vec_close("dt = 0 -> zero currents", currents, zero, 3, 0);
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, NAN, currents);
@@ -2191,42 +2207,51 @@ void test_body(void) {
     check_true(body_get_filter_resets() == 0, "eclipse: no filter resets");
     check_less("eclipse: max attitude error (deg)", worst, 5.0);
 
-    // A bad magnetometer forces detumbling on both prediction and measurement ticks.
+    // A single bad magnetometer sample while pointing is a glitch: keep the filter
     const char* bad_mag_cases[] = {"zero field", "NaN field", "NULL field",
-                                   "NULL previous field", "NaN previous field",
-                                   "zero field on measurement tick"};
+                                   "NULL previous field", "NaN previous field"};
     float zero_mag[3] = {0}, bad_prev[3] = {NAN, 0, 0};
-    for (int bad = 0; bad < 6; bad++) {
-        if (bad == 5) {
-            for (unsigned int k = 0; k < BODY_MEASUREMENT_UPDATE_PERIOD_TICKS - 1u; k++) {
-                body_sim_step(&s, true, 1, currents);
-            }
-        }
-        body_sim_advance(&s, 1);
-        float m1[3], g1[3], d1[NUM_DIODES];
-        body_sim_sensors(&s, true, m1, g1, d1);
-        const float* current = m1;
-        const float* previous = s.last_mag;
-        if (bad == 0 || bad == 5) current = zero_mag;
+    for (int bad = 0; bad < 5; bad++) {
+        const float* current = NULLPTR;
+        const float* previous = NULLPTR;
+        if (bad == 0) current = zero_mag;
         if (bad == 1) current = nan_mag;
-        if (bad == 2) current = NULLPTR;
         if (bad == 3) previous = NULLPTR;
         if (bad == 4) previous = bad_prev;
-        body(previous, current, g1, d1, NULLPTR, s.unix_time, s.jd_int,
-             (float)s.jd_frac, 1.0f, currents);
-        report(!body_is_pointing() && !body_get_attitude(q_dummy),
-               "bad magnetometer enters detumbling", "%s", bad_mag_cases[bad]);
-        body(previous, current, g1, d1, NULLPTR, s.unix_time, s.jd_int,
-             (float)s.jd_frac, 1.0f, currents);
-        report(!body_is_pointing(), "bad magnetometer stays in detumbling",
+        body_sim_bad_mag_step(&s, current, previous, bad <= 2, bad >= 3, currents);
+        report(body_is_pointing() && body_get_filter_resets() == 0,
+               "one bad magnetometer sample keeps pointing (no reset)", "%s", bad_mag_cases[bad]);
+        report(all_finite(currents, 3), "one bad magnetometer sample -> finite currents",
                "%s", bad_mag_cases[bad]);
-        memcpy(s.last_mag, m1, sizeof(m1));
         body_sim_step(&s, true, 1, currents);
-        report(body_is_pointing(), "valid magnetometer can resume pointing",
-               "%s", bad_mag_cases[bad]);
+        report(body_is_pointing(), "valid magnetometer continues pointing", "%s", bad_mag_cases[bad]);
     }
 
+    // A full measurement period of bad samples (so it covers a measurement tick) is still
+    // tolerated: the filter coasts on the gyro and stays accurate
+    for (unsigned int k = 0; k < BODY_MEASUREMENT_UPDATE_PERIOD_TICKS; k++) {
+        body_sim_bad_mag_step(&s, nan_mag, NULLPTR, true, false, currents);
+    }
+    check_true(body_is_pointing() && body_get_filter_resets() == 0,
+               "a measurement period of bad magnetometer samples keeps the filter");
+    check_less("attitude error after coasting a measurement period on the gyro (deg)",
+               body_attitude_error_deg(&s), 5.0);
+    body_sim_step(&s, true, 1, currents);
+
+    // A persistent fault resets exactly at BODY_MAG_FAULT_RESET_TICKS
+    for (unsigned int k = 0; k < BODY_MAG_FAULT_RESET_TICKS - 1u; k++) {
+        body_sim_bad_mag_step(&s, zero_mag, NULLPTR, true, false, currents);
+    }
+    check_true(body_is_pointing() && body_get_filter_resets() == 0,
+               "persistent bad magnetometer: still pointing one tick before the limit");
+    body_sim_bad_mag_step(&s, zero_mag, NULLPTR, true, false, currents);
+    check_true(!body_is_pointing() && !body_get_attitude(q_dummy) && body_get_filter_resets() == 1,
+               "persistent bad magnetometer: filter resets once at the limit");
+    body_sim_step(&s, true, 1, currents);
+    check_true(body_is_pointing(), "valid magnetometer after a persistent fault resumes pointing");
+
     // A large rate while pointing is treated as a new tumble or gyro fault.
+    int resets_before_glitch = body_get_filter_resets();
     {
         float m1[3], g1[3], d1[NUM_DIODES];
         body_sim_advance(&s, 1);
@@ -2238,7 +2263,7 @@ void test_body(void) {
     int steps_to_reset = -1;
     for (int k = 0; k < 20; k++) {
         body_sim_step(&s, true, 1, currents);
-        if (body_get_filter_resets() > 0) {
+        if (body_get_filter_resets() > resets_before_glitch) {
             steps_to_reset = k;
             break;
         }

@@ -23,6 +23,9 @@ extern const float R_IN_SHADOW[3 * 3];
     || BODY_MAGNETORQUER_QUIET_START_TICK > BODY_MEASUREMENT_UPDATE_PERIOD_TICKS
 #error "Magnetorquer quiet start must be within the measurement cycle"
 #endif
+/* Consecutive bad magnetometer ticks tolerated while pointing before the filter is reset.
+ * Shorter runs are treated as glitches: the filter coasts on the gyro and skips the update. */
+#define BODY_MAG_FAULT_RESET_TICKS (3u * BODY_MEASUREMENT_UPDATE_PERIOD_TICKS)
 
 /**
  * One ADCS step.
