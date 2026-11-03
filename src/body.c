@@ -1,7 +1,7 @@
 #include "include/body.h"
 #include "arm_math.h"
 #include "include/bdot.h"
-#include "include/down_quat.h"
+#include "include/pointing_error.h"
 #include "include/ecef2eci.h"
 #include "include/iterate.h"
 #include "include/kepler.h"
@@ -374,7 +374,7 @@ void body(const float* last_magnetometer_measurements, // 1x3
     // Body-frame error quaternion. (The old code used goal * est^-1, an ECI-frame error, and
     // fed it to a controller that works in body coordinates.)
     float q_err[4];
-    if (!pointing_error(r_eci, v_eci, estimated_quat, pvd_eci, q_want_prev, q_err, NULLPTR)) {
+    if (!pointing_error(r_eci, v_eci, estimated_quat, pvd_eci, q_want_prev, q_err)) {
         return;
     }
 

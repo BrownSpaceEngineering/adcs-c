@@ -7,15 +7,32 @@
 #include "math.h"
 #include <string.h>
 
+// Line-by-line port of the UKF in the Simulink MATLAB Function block (asbCubeSatACS.slx):
+// iterate, ensure_positive_definite, calculate_lambda, get_sigma_points, get_weights,
+// error_sigmas_to_quat_sigmas, propagate_quat_sigmas, get_measurements, get_error_vectors,
+// gradient_descent. Each function below names the MATLAB function it mirrors.
+//
+// Conventions (same as the MATLAB):
+//  - attitude errors are GLOBAL (ECI frame): q_sigma = dq(err) * q_est, err = rv(q_i * x^-1)
+//  - propagation is in the body frame: q <- q * dq((gyro - bias) dt)
+//  - Q is added after the unscented transform (P_hat = sum(...) + Q)
+//
+// The only intentional numerical deviation is quat2rotationvec (quat.c), which uses
+// 2*atan2(|v|, w) instead of MATLAB's 2*acos(w). The two are identical in exact arithmetic,
+// but acos(w) near w = 1 loses everything under ~1e-3 rad in float32.
+
 #define QUAT_SIGMA_SIZE (STATE_SIZE + 1) // [q (4), bias (3)]
-#define GRAD_DESCENT_MAX_ITERS 20
-#define GRAD_DESCENT_TOL 1e-6f
+#define GRAD_DESCENT_MAX_ITERS 100       // gradient_descent: for iter = 1:100
+#define GRAD_DESCENT_TOL 1e-9f           // gradient_descent: if norm(ave) < 1e-9
+#define PD_EPSILON 1e-9f                 // ensure_positive_definite: epsilon = 1e-9
+#define SIGMA_JITTER 1e-10f              // get_sigma_points: P + eye(n) * 1e-10
+#define JACOBI_MAX_SWEEPS 50
 
 /**
  * \fn cholesky_lower
  *
- * \brief L * L^T = A for a symmetric positive definite n x n A. Unlike arm_mat_cholesky_f32
- * alone, this also zeroes the strict upper triangle of L (CMSIS leaves it untouched).
+ * \brief L * L^T = A for a symmetric positive definite n x n A (L^T is MATLAB's chol(A)).
+ * Zeroes the strict upper triangle of L, which CMSIS leaves untouched.
  */
 static bool cholesky_lower(const float32_t* A, float32_t* L, int n) {
     memset(L, 0, sizeof(float32_t) * n * n);
@@ -33,55 +50,83 @@ static bool cholesky_lower(const float32_t* A, float32_t* L, int n) {
 }
 
 /**
+ * \fn sym_min_eig
+ *
+ * \brief Smallest eigenvalue of a symmetric n x n matrix (n <= STATE_SIZE), cyclic Jacobi.
+ * Stands in for min(real(eig(P))); CMSIS has no eigen-solver.
+ */
+static float32_t sym_min_eig(const float32_t* P, int n) {
+    float32_t A[STATE_SIZE * STATE_SIZE];
+    memcpy(A, P, sizeof(float32_t) * n * n);
+    for (int sweep = 0; sweep < JACOBI_MAX_SWEEPS; sweep++) {
+        float32_t off = 0.0f, diag_sq = 0.0f;
+        for (int i = 0; i < n; i++) {
+            diag_sq += A[i * n + i] * A[i * n + i];
+            for (int j = i + 1; j < n; j++) {
+                off += A[i * n + j] * A[i * n + j];
+            }
+        }
+        if (off <= 1e-14f * diag_sq || off < 1e-37f) {
+            break;
+        }
+        for (int p = 0; p < n; p++) {
+            for (int q = p + 1; q < n; q++) {
+                float32_t apq = A[p * n + q];
+                if (fabsf(apq) < 1e-38f) {
+                    continue;
+                }
+                float32_t theta = (A[q * n + q] - A[p * n + p]) / (2.0f * apq);
+                float32_t t = (theta >= 0.0f ? 1.0f : -1.0f) / (fabsf(theta) + sqrtf(theta * theta + 1.0f));
+                float32_t c = 1.0f / sqrtf(t * t + 1.0f);
+                float32_t s = t * c;
+                for (int k = 0; k < n; k++) { // A <- A J (columns p, q)
+                    float32_t akp = A[k * n + p], akq = A[k * n + q];
+                    A[k * n + p] = c * akp - s * akq;
+                    A[k * n + q] = s * akp + c * akq;
+                }
+                for (int k = 0; k < n; k++) { // A <- J^T A (rows p, q)
+                    float32_t apk = A[p * n + k], aqk = A[q * n + k];
+                    A[p * n + k] = c * apk - s * aqk;
+                    A[q * n + k] = s * apk + c * aqk;
+                }
+            }
+        }
+    }
+    float32_t m = A[0];
+    for (int i = 1; i < n; i++) {
+        m = fminf(m, A[i * n + i]);
+    }
+    return m;
+}
+
+/**
  * \fn ensure_psd
  *
- * \brief Makes a square matrix (n <= STATE_SIZE) symmetric positive definite in place.
+ * \brief Port of ensure_positive_definite(P) (epsilon = 1e-9), in place, n <= STATE_SIZE:
+ *   P = (P + P') / 2;
+ *   if min(eig(P)) < epsilon, P = P + eye(n) * (epsilon - min(eig(P)) + epsilon); end
  *
- * Port of ensure_positive_definite() from simulink.m. MATLAB uses eig(); CMSIS has no symmetric
- * eigen-solver, so instead we test with a Cholesky factorization and add growing diagonal jitter
- * until it succeeds. Unlike the old version, a healthy matrix is left unchanged (no epsilon is
- * added every call).
- *
- * \return false if the matrix contains NaN/inf or could not be repaired
+ * \return false if the matrix contains NaN/inf (MATLAB would propagate them)
  */
 bool ensure_psd(float32_t* P, int n) {
     if (n <= 0 || n > STATE_SIZE || !all_finite(P, n * n)) {
         return false;
     }
-
-    // 1. Force perfect symmetry: P = (P + P^T) / 2
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
-            float avg = 0.5f * (P[i * n + j] + P[j * n + i]);
+            float32_t avg = 0.5f * (P[i * n + j] + P[j * n + i]);
             P[i * n + j] = avg;
             P[j * n + i] = avg;
         }
     }
-
-    float32_t L[STATE_SIZE * STATE_SIZE];
-    if (cholesky_lower(P, L, n)) {
-        return true;
-    }
-
-    // 2. Add jitter relative to the matrix scale until the factorization succeeds
-    float scale = 0.0f;
-    for (int i = 0; i < n; i++) {
-        scale = fmaxf(scale, fabsf(P[i * n + i]));
-    }
-    if (!(scale > 0.0f)) {
-        scale = 1.0f;
-    }
-    float jitter = 1e-7f * scale;
-    for (int attempt = 0; attempt < 12; attempt++) {
+    float32_t min_eig = sym_min_eig(P, n);
+    if (min_eig < PD_EPSILON) {
+        float32_t shift = PD_EPSILON - min_eig + PD_EPSILON;
         for (int i = 0; i < n; i++) {
-            P[i * n + i] += jitter;
+            P[i * n + i] += shift;
         }
-        if (cholesky_lower(P, L, n)) {
-            return true;
-        }
-        jitter *= 10.0f;
     }
-    return false;
+    return all_finite(P, n * n);
 }
 
 /**
@@ -96,21 +141,23 @@ float32_t calculate_lambda(int n, float32_t alpha, float32_t kappa) {
 /**
  * \fn get_sigma_points
  *
- * \brief Generates the 2n+1 sigma points x, x + col_k(L), x - col_k(L) with
- * L L^T = (n + lambda) P.
+ * \brief Port of get_sigma_points(lam, x, P):
+ *   P = (P + P')/2 + eye(n)*1e-10;  U = chol((lam + n) * P);
+ *   sigmas = [x; x + U(k,:) for k = 1..n; x - U(k,:) for k = 1..n]
+ * Rows of MATLAB's upper U are columns of the lower CMSIS factor L = U'.
  *
- * The previous version used rows of the (lower-triangular) CMSIS Cholesky factor together
- * with its uninitialized upper triangle. Rows of L only reproduce P when P is diagonal, so
- * every step after the first produced the wrong spread. Columns of L (= rows of MATLAB's
- * upper-triangular chol(P)) are the correct offsets.
+ * \return false where MATLAB's chol would error (matrix not positive definite)
  */
 bool get_sigma_points(float32_t lam, const float32_t* state, const float32_t* P, float32_t* sigmas) {
     float32_t P1[STATE_SIZE * STATE_SIZE];
-    for (int i = 0; i < STATE_SIZE * STATE_SIZE; i++) {
-        P1[i] = P[i] * (lam + STATE_SIZE);
-    }
-    if (!ensure_psd(P1, STATE_SIZE)) {
-        return false;
+    for (int i = 0; i < STATE_SIZE; i++) {
+        for (int j = 0; j < STATE_SIZE; j++) {
+            float32_t sym = 0.5f * (P[i * STATE_SIZE + j] + P[j * STATE_SIZE + i]);
+            if (i == j) {
+                sym += SIGMA_JITTER;
+            }
+            P1[i * STATE_SIZE + j] = (lam + STATE_SIZE) * sym;
+        }
     }
 
     float32_t L[STATE_SIZE * STATE_SIZE];
@@ -123,7 +170,7 @@ bool get_sigma_points(float32_t lam, const float32_t* state, const float32_t* P,
         float32_t* plus = &sigmas[(1 + k) * STATE_SIZE];
         float32_t* minus = &sigmas[(1 + STATE_SIZE + k) * STATE_SIZE];
         for (int i = 0; i < STATE_SIZE; i++) {
-            float32_t offset = L[i * STATE_SIZE + k]; // column k
+            float32_t offset = L[i * STATE_SIZE + k]; // column k of L == row k of U
             plus[i] = state[i] + offset;
             minus[i] = state[i] - offset;
         }
@@ -134,7 +181,7 @@ bool get_sigma_points(float32_t lam, const float32_t* state, const float32_t* P,
 /**
  * \fn get_weights
  *
- * \brief Calculates the mean and covariance weights for the Unscented Kalman Filter.
+ * \brief Port of get_weights(lam, x, alpha, beta).
  */
 void get_weights(float32_t lambda, int n, float32_t alpha, float32_t beta, float32_t* cov_weights,
                  float32_t* mean_weights) {
@@ -145,24 +192,24 @@ void get_weights(float32_t lambda, int n, float32_t alpha, float32_t beta, float
         mean_weights[i] = c;
     }
 
+    cov_weights[0] = lambda / ((float32_t)n + lambda) + (1 - alpha * alpha + beta);
     mean_weights[0] = lambda / ((float32_t)n + lambda);
-    cov_weights[0] = mean_weights[0] + (1 - alpha * alpha + beta);
 }
 
 /**
  * \fn error_sigmas_to_quat_sigmas
  *
- * \brief Applies each sigma's (local) attitude error to the current estimate:
- * q_i = q_est * dq(err_i). Output rows are [q (4), bias (3)].
+ * \brief Port of error_sigmas_to_quat_sigmas: q_i = normalize(rv2q(err_i) * rotation).
+ * Output rows are [q (4), bias (3)].
  */
-static void error_sigmas_to_quat_sigmas(const float32_t* error_sigmas, const float32_t* current_guess,
+static void error_sigmas_to_quat_sigmas(const float32_t* error_sigmas, const float32_t* rotation,
                                         float32_t* quat_sigmas) {
     for (int i = 0; i < NUM_SIGMAS; i++) {
         const float32_t* err = &error_sigmas[i * STATE_SIZE];
         float32_t* out = &quat_sigmas[i * QUAT_SIGMA_SIZE];
-        float32_t error_quat[4];
-        rotationvec2quat(err, error_quat);
-        quat_multiply(current_guess, error_quat, out);
+        float32_t quat_rot[4];
+        rotationvec2quat(err, quat_rot);
+        quat_multiply(quat_rot, rotation, out);
         quat_norm(out, out);
         out[4] = err[3];
         out[5] = err[4];
@@ -171,35 +218,33 @@ static void error_sigmas_to_quat_sigmas(const float32_t* error_sigmas, const flo
 }
 
 /**
- * \fn propagate_sigmas
+ * \fn propagate_quat_sigmas
  *
- * \brief Propagates each quaternion sigma by its own bias-corrected gyro rate:
- * q <- q * dq((gyro - bias) dt).
+ * \brief Port of propagate_quat_sigmas: q <- normalize(q * rv2q((gyro - bias) * dt)).
  */
-static void propagate_sigmas(float32_t* quat_sigmas, const float32_t* gyro, float dt) {
+static void propagate_quat_sigmas(float32_t* quat_sigmas, const float32_t* gyro, float32_t dt) {
     for (int i = 0; i < NUM_SIGMAS; i++) {
         float32_t* s = &quat_sigmas[i * QUAT_SIGMA_SIZE];
-        float32_t omega_dt[3] = {(gyro[0] - s[4]) * dt, (gyro[1] - s[5]) * dt, (gyro[2] - s[6]) * dt};
+        float32_t w_dt[3] = {(gyro[0] - s[4]) * dt, (gyro[1] - s[5]) * dt, (gyro[2] - s[6]) * dt};
         float32_t delta_q[4];
-        rotationvec2quat(omega_dt, delta_q);
+        rotationvec2quat(w_dt, delta_q);
         quat_multiply(s, delta_q, s);
         quat_norm(s, s);
     }
 }
 
 /**
- * \fn get_sigma_measurements
+ * \fn get_measurements
  *
- * \brief Predicted body-frame measurements: ref vectors rotated by each sigma's ref->body.
+ * \brief Port of get_measurements: each ref vector rotated by quaternion_inverse(q_i).
  */
-static void get_sigma_measurements(const float32_t* quat_sigmas, const float32_t* ref, int num_vecs,
-                                   float32_t* msmts) {
+static void get_measurements(const float32_t* quat_sigmas, const float32_t* ref, int num_vecs, float32_t* msmts) {
     int m = 3 * num_vecs;
     for (int i = 0; i < NUM_SIGMAS; i++) {
-        float32_t ref_to_body[4];
-        quat_conj(&quat_sigmas[i * QUAT_SIGMA_SIZE], ref_to_body);
+        float32_t eci_to_body[4];
+        quat_inv(&quat_sigmas[i * QUAT_SIGMA_SIZE], eci_to_body);
         for (int v = 0; v < num_vecs; v++) {
-            quat_apply(ref_to_body, &ref[3 * v], &msmts[i * m + 3 * v]);
+            quat_apply(eci_to_body, &ref[3 * v], &msmts[i * m + 3 * v]);
         }
     }
 }
@@ -207,55 +252,51 @@ static void get_sigma_measurements(const float32_t* quat_sigmas, const float32_t
 /**
  * \fn get_error_vectors
  *
- * \brief Local error rotation vectors of each sigma quaternion about x: rv(x^-1 * q_i).
+ * \brief Port of get_error_vectors(Y, x): rv(Y_i * x^-1) (global error).
  */
 static void get_error_vectors(const float32_t* quat_sigmas, const float32_t* x, float32_t* error_vecs) {
     float32_t x_inv[4];
-    quat_conj(x, x_inv);
+    quat_inv(x, x_inv);
     for (int i = 0; i < NUM_SIGMAS; i++) {
         float32_t err_quat[4];
-        quat_multiply(x_inv, &quat_sigmas[i * QUAT_SIGMA_SIZE], err_quat);
+        quat_multiply(&quat_sigmas[i * QUAT_SIGMA_SIZE], x_inv, err_quat);
         quat2rotationvec(err_quat, &error_vecs[i * 3]);
     }
 }
 
 /**
- * \fn grad_descent
+ * \fn gradient_descent
  *
- * \brief Weighted quaternion mean of the sigma points (as in simulink.m's gradient_descent,
- * but in the local-error convention). error_vecs always correspond to the returned average.
+ * \brief Port of gradient_descent(Y, x, weights). Like the MATLAB, x is not renormalized
+ * and, if all 100 iterations run, error_vecs belong to the second-to-last x.
  */
-static void grad_descent(const float32_t* quat_sigmas, const float32_t* initial, const float32_t* weights,
-                         float32_t* avg_quat, float32_t* error_vecs) {
+static void gradient_descent(const float32_t* quat_sigmas, const float32_t* x0, const float32_t* weights,
+                             float32_t* x, float32_t* error_vecs) {
     float32_t w_sum = 0.0f;
     for (int i = 0; i < NUM_SIGMAS; i++) {
         w_sum += weights[i];
     }
-    if (fabsf(w_sum) < 1e-12f) {
-        w_sum = 1.0f;
+    float32_t w[NUM_SIGMAS];
+    for (int i = 0; i < NUM_SIGMAS; i++) {
+        w[i] = weights[i] / w_sum;
     }
 
-    float32_t moving_avg[4];
-    quat_norm(initial, moving_avg);
+    memcpy(x, x0, sizeof(float32_t) * 4);
     for (int iter = 0; iter < GRAD_DESCENT_MAX_ITERS; iter++) {
-        get_error_vectors(quat_sigmas, moving_avg, error_vecs);
-        float32_t avg_err[3] = {0, 0, 0};
+        get_error_vectors(quat_sigmas, x, error_vecs);
+        float32_t ave[3] = {0, 0, 0};
         for (int i = 0; i < NUM_SIGMAS; i++) {
             for (int j = 0; j < 3; j++) {
-                avg_err[j] += weights[i] * error_vecs[i * 3 + j] / w_sum;
+                ave[j] += error_vecs[i * 3 + j] * w[i];
             }
         }
-        if (l2_norm(avg_err, 3) < GRAD_DESCENT_TOL) {
-            memcpy(avg_quat, moving_avg, sizeof(float32_t) * 4);
-            return;
+        if (l2_norm(ave, 3) < GRAD_DESCENT_TOL) {
+            break;
         }
-        float32_t avg_error_quat[4];
-        rotationvec2quat(avg_err, avg_error_quat);
-        quat_multiply(moving_avg, avg_error_quat, moving_avg);
-        quat_norm(moving_avg, moving_avg);
+        float32_t ave_quat[4];
+        rotationvec2quat(ave, ave_quat);
+        quat_multiply(ave_quat, x, x);
     }
-    get_error_vectors(quat_sigmas, moving_avg, error_vecs);
-    memcpy(avg_quat, moving_avg, sizeof(float32_t) * 4);
 }
 
 ukf_status_t iterate(const float* error_state, const float* quat_state, const float* cov,
@@ -287,33 +328,30 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
         UKF_FAIL(UKF_ERR_ARGS);
     }
 
-    // --- Predict ---
-    float P_Q[STATE_SIZE * STATE_SIZE];
-    for (int i = 0; i < STATE_SIZE * STATE_SIZE; i++) {
-        P_Q[i] = P_in[i] + Q[i];
-    }
-    if (!ensure_psd(P_Q, STATE_SIZE)) {
+    // current_cov = ensure_positive_definite(current_cov);
+    float current_cov[STATE_SIZE * STATE_SIZE];
+    memcpy(current_cov, P_in, sizeof(current_cov));
+    if (!ensure_psd(current_cov, STATE_SIZE)) {
         UKF_FAIL(UKF_ERR_CHOLESKY);
     }
 
-    float lambda = calculate_lambda(STATE_SIZE, UKF_ALPHA, UKF_KAPPA);
-    float mean_weights[NUM_SIGMAS];
-    float cov_weights[NUM_SIGMAS];
-    get_weights(lambda, STATE_SIZE, UKF_ALPHA, UKF_BETA, cov_weights, mean_weights);
-
-    float error_sigmas[NUM_SIGMAS * STATE_SIZE];
-    if (!get_sigma_points(lambda, x_in, P_Q, error_sigmas)) {
+    float lam = calculate_lambda(STATE_SIZE, UKF_ALPHA, UKF_KAPPA);
+    float sigmas[NUM_SIGMAS * STATE_SIZE];
+    if (!get_sigma_points(lam, x_in, current_cov, sigmas)) {
         UKF_FAIL(UKF_ERR_CHOLESKY);
     }
-
     float quat_sigmas[NUM_SIGMAS * QUAT_SIGMA_SIZE];
-    error_sigmas_to_quat_sigmas(error_sigmas, q_in, quat_sigmas);
-    propagate_sigmas(quat_sigmas, gyro, dt);
+    error_sigmas_to_quat_sigmas(sigmas, q_in, quat_sigmas);
+    propagate_quat_sigmas(quat_sigmas, gyro, dt); // always propagate
 
-    // Mean attitude, starting from the propagated central sigma point
-    float avg_quat[4];
+    float covariance_weights[NUM_SIGMAS];
+    float mean_weights[NUM_SIGMAS];
+    get_weights(lam, STATE_SIZE, UKF_ALPHA, UKF_BETA, covariance_weights, mean_weights);
+
+    // [average_quaternion, propagated_error_vectors] = gradient_descent(..., current_guess, mean_weights)
+    float average_quaternion[4];
     float err_vecs[NUM_SIGMAS * 3];
-    grad_descent(quat_sigmas, &quat_sigmas[0], mean_weights, avg_quat, err_vecs);
+    gradient_descent(quat_sigmas, q_in, mean_weights, average_quaternion, err_vecs);
 
     float propagated_errors[NUM_SIGMAS * STATE_SIZE];
     for (int i = 0; i < NUM_SIGMAS; i++) {
@@ -323,17 +361,17 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
         }
     }
 
-    float mean_err[STATE_SIZE] = {0};
-    for (int i = 0; i < NUM_SIGMAS; i++) {
-        for (int j = 0; j < STATE_SIZE; j++) {
-            mean_err[j] += mean_weights[i] * propagated_errors[i * STATE_SIZE + j];
+    float mean_error[STATE_SIZE] = {0};
+    for (int col = 0; col < STATE_SIZE; col++) {
+        for (int row = 0; row < NUM_SIGMAS; row++) {
+            mean_error[col] += propagated_errors[row * STATE_SIZE + col] * mean_weights[row];
         }
     }
 
     float dx[NUM_SIGMAS * STATE_SIZE];
     for (int i = 0; i < NUM_SIGMAS; i++) {
         for (int j = 0; j < STATE_SIZE; j++) {
-            dx[i * STATE_SIZE + j] = propagated_errors[i * STATE_SIZE + j] - mean_err[j];
+            dx[i * STATE_SIZE + j] = propagated_errors[i * STATE_SIZE + j] - mean_error[j];
         }
     }
 
@@ -341,53 +379,58 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
     for (int i = 0; i < NUM_SIGMAS; i++) {
         for (int r = 0; r < STATE_SIZE; r++) {
             for (int c = 0; c < STATE_SIZE; c++) {
-                P_hat[r * STATE_SIZE + c] += cov_weights[i] * dx[i * STATE_SIZE + r] * dx[i * STATE_SIZE + c];
+                P_hat[r * STATE_SIZE + c] += covariance_weights[i] * dx[i * STATE_SIZE + r] * dx[i * STATE_SIZE + c];
             }
         }
+    }
+    for (int i = 0; i < STATE_SIZE * STATE_SIZE; i++) {
+        P_hat[i] += Q[i]; // process noise always accrues, every propagate step
     }
 
     float x_hat[STATE_SIZE];
     float P[STATE_SIZE * STATE_SIZE];
-    memcpy(x_hat, mean_err, sizeof(x_hat));
-    memcpy(P, P_hat, sizeof(P));
 
-    // --- Update ---
     if (num_vecs > 0) {
-        float sigma_msmts[NUM_SIGMAS * MAX_MSMT_SIZE];
-        get_sigma_measurements(quat_sigmas, ref, num_vecs, sigma_msmts);
+        // --- MEASUREMENT CORRECTION ---
+        float measurements[NUM_SIGMAS * MAX_MSMT_SIZE];
+        get_measurements(quat_sigmas, ref, num_vecs, measurements);
 
-        float mean_msmt[MAX_MSMT_SIZE] = {0};
-        for (int i = 0; i < NUM_SIGMAS; i++) {
-            for (int j = 0; j < m; j++) {
-                mean_msmt[j] += mean_weights[i] * sigma_msmts[i * m + j];
+        float mean_measurement[MAX_MSMT_SIZE] = {0};
+        for (int col = 0; col < m; col++) {
+            for (int row = 0; row < NUM_SIGMAS; row++) {
+                mean_measurement[col] += measurements[row * m + col] * mean_weights[row];
             }
         }
 
         float dz[NUM_SIGMAS * MAX_MSMT_SIZE];
         for (int i = 0; i < NUM_SIGMAS; i++) {
             for (int j = 0; j < m; j++) {
-                dz[i * m + j] = sigma_msmts[i * m + j] - mean_msmt[j];
+                dz[i * m + j] = measurements[i * m + j] - mean_measurement[j];
             }
         }
 
         float P_xz[STATE_SIZE * MAX_MSMT_SIZE] = {0};
-        float P_vv[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
-        memcpy(P_vv, R, sizeof(float) * m * m);
+        float P_zz[MAX_MSMT_SIZE * MAX_MSMT_SIZE] = {0};
         for (int i = 0; i < NUM_SIGMAS; i++) {
             for (int r = 0; r < STATE_SIZE; r++) {
                 for (int c = 0; c < m; c++) {
-                    P_xz[r * m + c] += cov_weights[i] * dx[i * STATE_SIZE + r] * dz[i * m + c];
+                    P_xz[r * m + c] += covariance_weights[i] * dx[i * STATE_SIZE + r] * dz[i * m + c];
                 }
             }
             for (int r = 0; r < m; r++) {
                 for (int c = 0; c < m; c++) {
-                    P_vv[r * m + c] += cov_weights[i] * dz[i * m + r] * dz[i * m + c];
+                    P_zz[r * m + c] += covariance_weights[i] * dz[i * m + r] * dz[i * m + c];
                 }
             }
         }
 
-        // arm_mat_inverse_f32 destroys its input, so invert a scratch copy. (The old code
-        // inverted P_vv in place and then reused the destroyed P_vv in K P_vv K^T.)
+        // P_vv = P_zz + R
+        float P_vv[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
+        for (int i = 0; i < m * m; i++) {
+            P_vv[i] = P_zz[i] + R[i];
+        }
+
+        // k = P_xz * inv(P_vv). arm_mat_inverse_f32 destroys its input, so invert a copy.
         float P_vv_scratch[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
         float P_vv_inv[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
         memcpy(P_vv_scratch, P_vv, sizeof(float) * m * m);
@@ -397,43 +440,58 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
             || !all_finite(P_vv_inv, m * m)) {
             UKF_FAIL(UKF_ERR_SINGULAR);
         }
-
-        // K = P_xz P_vv^-1
         float K[STATE_SIZE * MAX_MSMT_SIZE];
         arm_matrix_instance_f32 P_xz_mat = {STATE_SIZE, (uint16_t)m, P_xz};
         arm_matrix_instance_f32 K_mat = {STATE_SIZE, (uint16_t)m, K};
         arm_mat_mult_f32(&P_xz_mat, &P_vv_inv_mat, &K_mat);
 
+        // x_hat = mean_error + (k * (body_msmts - mean_measurement)')'
         for (int r = 0; r < STATE_SIZE; r++) {
             float corr = 0.0f;
             for (int c = 0; c < m; c++) {
-                corr += K[r * m + c] * (body[c] - mean_msmt[c]);
+                corr += K[r * m + c] * (body[c] - mean_measurement[c]);
             }
-            x_hat[r] += corr;
+            x_hat[r] = mean_error[r] + corr;
         }
 
-        // P = P_hat - K P_vv K^T  (== P_hat - K P_xz^T)
+        // P = P_hat - k * P_vv * k'
+        float KPvv[STATE_SIZE * MAX_MSMT_SIZE];
+        for (int r = 0; r < STATE_SIZE; r++) {
+            for (int c = 0; c < m; c++) {
+                float acc = 0.0f;
+                for (int j = 0; j < m; j++) {
+                    acc += K[r * m + j] * P_vv[j * m + c];
+                }
+                KPvv[r * m + c] = acc;
+            }
+        }
         for (int r = 0; r < STATE_SIZE; r++) {
             for (int c = 0; c < STATE_SIZE; c++) {
                 float acc = 0.0f;
                 for (int j = 0; j < m; j++) {
-                    acc += K[r * m + j] * P_xz[c * m + j];
+                    acc += KPvv[r * m + j] * K[c * m + j];
                 }
-                P[r * STATE_SIZE + c] -= acc;
+                P[r * STATE_SIZE + c] = P_hat[r * STATE_SIZE + c] - acc;
             }
         }
+    } else {
+        // --- PREDICT-ONLY ---
+        memcpy(x_hat, mean_error, sizeof(x_hat));
+        memcpy(P, P_hat, sizeof(P));
     }
 
+    // P = ensure_positive_definite(P);
     if (!ensure_psd(P, STATE_SIZE)) {
         UKF_FAIL(UKF_ERR_CHOLESKY);
     }
 
-    // Fold the attitude correction into the quaternion (local convention)
+    // new_guess = rotation_vec2quaternion(x_hat(1:3)) * average_quaternion (not renormalized, as in MATLAB)
     float x_hat_rot[4];
     rotationvec2quat(x_hat, x_hat_rot);
     float new_guess[4];
-    quat_multiply(avg_quat, x_hat_rot, new_guess);
-    quat_norm(new_guess, new_guess);
+    quat_multiply(x_hat_rot, average_quaternion, new_guess);
+
+    // The Simulink block resets error_state(1:3) = 0 right after iterate(); done here instead
     x_hat[0] = 0.0f;
     x_hat[1] = 0.0f;
     x_hat[2] = 0.0f;
