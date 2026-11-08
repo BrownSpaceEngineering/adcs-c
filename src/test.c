@@ -4,7 +4,7 @@
 #include "arm_math.h"
 #include "include/bdot.h"
 #include "include/body.h"
-#include "include/down_quat.h"
+#include "include/pointing_error.h"
 #include "include/ecef2eci.h"
 #include "include/filters.h"
 #include "include/iterate.h"
@@ -1824,16 +1824,20 @@ void test_photodiodes(void) {
 // Pointing
 // =============================================================================================
 void test_pointing(void) {
-    begin_suite("pointing (pointing_error.m / down_quat)");
+    begin_suite("pointing (pointing_error.m)");
     float ez[3] = {0, 0, 1}, ey[3] = {0, 1, 0}, ex[3] = {1, 0, 0};
 
     float r[3] = {7.0e6f, 0, 0}, v[3] = {0, 7500, 0}, target[3] = {6.37e6f, 0, 0};
     float id[4] = {1, 0, 0, 0}, q_err[4], z_want[3];
     float prev[4] = {1, 0, 0, 0};
-    bool ok = pointing_error(r, v, id, target, prev, q_err, z_want);
+    bool ok = pointing_error(r, v, id, target, prev, q_err);
     check_true(ok, "normal geometry succeeds");
     float nadir[3] = {-1, 0, 0};
-    check_vec_close("z_want points at the target", z_want, nadir, 3, 1e-6f);
+    for (int i = 0; i < 3; i++) {
+        z_want[i] = target[i] - r[i];
+    }
+    normalize_vec(z_want, 3);
+    check_vec_close("unit vector to the target is nadir", z_want, nadir, 3, 1e-6f);
 
     // With current attitude = identity, q_err == q_want
     float bz[3], by[3], bx[3];
@@ -1849,7 +1853,7 @@ void test_pointing(void) {
     // Already at the desired attitude -> identity error, and the PD produces no torque
     float q_want[4];
     memcpy(q_want, q_err, sizeof(q_want));
-    ok = pointing_error(r, v, q_want, target, prev, q_err, NULL);
+    ok = pointing_error(r, v, q_want, target, prev, q_err);
     float rv[3];
     quat2rotationvec(q_err, rv);
     check_less("at the goal the error rotation is ~0 (deg)", RAD2DEG(l2_norm(rv, 3)), 1e-3);
@@ -1858,7 +1862,7 @@ void test_pointing(void) {
     // q_want (q_b2eci * q_err == q_want)
     float q_cur[4] = {0.9f, 0.2f, -0.3f, 0.1f};
     quat_norm(q_cur, q_cur);
-    pointing_error(r, v, q_cur, target, prev, q_err, NULL);
+    pointing_error(r, v, q_cur, target, prev, q_err);
     float recon[4];
     quat_multiply(q_cur, q_err, recon);
     check_less("q_b2eci * q_err == q_want (body-frame error)", RAD2DEG(quat_angle_between(recon, q_want)), 1e-3);
@@ -1866,35 +1870,16 @@ void test_pointing(void) {
     // Hemisphere continuity via q_want_prev
     float prev_neg[4] = {-q_want[0], -q_want[1], -q_want[2], -q_want[3]};
     float q_err2[4];
-    pointing_error(r, v, id, target, prev_neg, q_err2, NULL);
+    pointing_error(r, v, id, target, prev_neg, q_err2);
     check_true(dot3(&q_err2[1], &prev_neg[1]) + q_err2[0] * prev_neg[0] > 0,
                "q_want is kept in the same hemisphere as q_want_prev");
 
     float v_par[3] = {-1, 0, 0};
-    ok = pointing_error(r, v_par, id, target, prev, q_err, NULL);
+    ok = pointing_error(r, v_par, id, target, prev, q_err);
     check_true(!ok, "velocity along the line of sight is rejected");
     check_vec_close("degenerate geometry gives identity error", q_err, id, 4, 0);
-    ok = pointing_error(r, v, id, r, prev, q_err, NULL);
+    ok = pointing_error(r, v, id, r, prev, q_err);
     check_true(!ok, "target at the satellite position is rejected");
-
-    // down_quat: body z toward target, right-handed, minimal roll
-    float goal[4];
-    down_quat(r, target, id, goal);
-    quat_apply(goal, ez, bz);
-    check_vec_close("down_quat: body z points at the target (old version pointed away)", bz, nadir, 3, 1e-5f);
-    float Rg[9];
-    quat2rotm(goal, Rg);
-    float det = Rg[0] * (Rg[4] * Rg[8] - Rg[5] * Rg[7]) - Rg[1] * (Rg[3] * Rg[8] - Rg[5] * Rg[6])
-                + Rg[2] * (Rg[3] * Rg[7] - Rg[4] * Rg[6]);
-    check_close("down_quat: proper rotation (det = +1; old version built a det = -1 frame)", det, 1, 1e-5);
-    quat_apply(goal, ey, by);
-    check_vec_close("down_quat: keeps the current body y axis when possible", by, ey, 3, 1e-5f);
-    float target_along_y[3] = {7.0e6f, 1.0e6f, 0};
-    down_quat(r, target_along_y, id, goal);
-    quat_apply(goal, ez, bz);
-    check_vec_close("down_quat: degenerate (y parallel to target) still points z at the target", bz, ey, 3, 1e-5f);
-    down_quat(r, r, id, goal);
-    check_vec_close("down_quat: coincident points give identity", goal, id, 4, 0);
 }
 
 // =============================================================================================
@@ -2062,6 +2047,21 @@ static void body_sim_step(body_sim_t* s, bool sunlit, int dt_s, float* currents)
     memcpy(s->last_mag, mag, sizeof(mag));
 }
 
+// One sunlit body() call with the current and/or previous magnetometer sample replaced (either
+// may be NULLPTR). The good reading is still recorded as last_mag, so the next normal step sees a
+// valid previous sample.
+static void body_sim_bad_mag_step(body_sim_t* s, const float* bad_current, const float* bad_previous,
+                                  bool replace_current, bool replace_previous, float* currents) {
+    body_sim_advance(s, 1);
+    float mag[3], gyro[3], diodes[NUM_DIODES];
+    body_sim_sensors(s, true, mag, gyro, diodes);
+    const float* current = replace_current ? bad_current : mag;
+    const float* previous = replace_previous ? bad_previous : s->last_mag;
+    body(previous, current, gyro, diodes, NULLPTR, s->unix_time, s->jd_int, (float)s->jd_frac,
+         1.0f, currents);
+    memcpy(s->last_mag, mag, sizeof(mag));
+}
+
 static float body_attitude_error_deg(const body_sim_t* s) {
     float q[4];
     body_get_attitude(q);
@@ -2122,6 +2122,7 @@ void test_body(void) {
     float nan_mag[3] = {NAN, 0, 0};
     body(mag_prev, nan_mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
     check_vec_close("NaN magnetometer -> zero currents", currents, zero, 3, 0);
+    check_true(body_get_filter_resets() == 0, "bad magnetometer while detumbling -> no filter reset");
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.0f, currents);
     check_vec_close("dt = 0 -> zero currents", currents, zero, 3, 0);
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, NAN, currents);
@@ -2206,42 +2207,51 @@ void test_body(void) {
     check_true(body_get_filter_resets() == 0, "eclipse: no filter resets");
     check_less("eclipse: max attitude error (deg)", worst, 5.0);
 
-    // A bad magnetometer forces detumbling on both prediction and measurement ticks.
+    // A single bad magnetometer sample while pointing is a glitch: keep the filter
     const char* bad_mag_cases[] = {"zero field", "NaN field", "NULL field",
-                                   "NULL previous field", "NaN previous field",
-                                   "zero field on measurement tick"};
+                                   "NULL previous field", "NaN previous field"};
     float zero_mag[3] = {0}, bad_prev[3] = {NAN, 0, 0};
-    for (int bad = 0; bad < 6; bad++) {
-        if (bad == 5) {
-            for (unsigned int k = 0; k < BODY_MEASUREMENT_UPDATE_PERIOD_TICKS - 1u; k++) {
-                body_sim_step(&s, true, 1, currents);
-            }
-        }
-        body_sim_advance(&s, 1);
-        float m1[3], g1[3], d1[NUM_DIODES];
-        body_sim_sensors(&s, true, m1, g1, d1);
-        const float* current = m1;
-        const float* previous = s.last_mag;
-        if (bad == 0 || bad == 5) current = zero_mag;
+    for (int bad = 0; bad < 5; bad++) {
+        const float* current = NULLPTR;
+        const float* previous = NULLPTR;
+        if (bad == 0) current = zero_mag;
         if (bad == 1) current = nan_mag;
-        if (bad == 2) current = NULLPTR;
         if (bad == 3) previous = NULLPTR;
         if (bad == 4) previous = bad_prev;
-        body(previous, current, g1, d1, NULLPTR, s.unix_time, s.jd_int,
-             (float)s.jd_frac, 1.0f, currents);
-        report(!body_is_pointing() && !body_get_attitude(q_dummy),
-               "bad magnetometer enters detumbling", "%s", bad_mag_cases[bad]);
-        body(previous, current, g1, d1, NULLPTR, s.unix_time, s.jd_int,
-             (float)s.jd_frac, 1.0f, currents);
-        report(!body_is_pointing(), "bad magnetometer stays in detumbling",
+        body_sim_bad_mag_step(&s, current, previous, bad <= 2, bad >= 3, currents);
+        report(body_is_pointing() && body_get_filter_resets() == 0,
+               "one bad magnetometer sample keeps pointing (no reset)", "%s", bad_mag_cases[bad]);
+        report(all_finite(currents, 3), "one bad magnetometer sample -> finite currents",
                "%s", bad_mag_cases[bad]);
-        memcpy(s.last_mag, m1, sizeof(m1));
         body_sim_step(&s, true, 1, currents);
-        report(body_is_pointing(), "valid magnetometer can resume pointing",
-               "%s", bad_mag_cases[bad]);
+        report(body_is_pointing(), "valid magnetometer continues pointing", "%s", bad_mag_cases[bad]);
     }
 
+    // A full measurement period of bad samples (so it covers a measurement tick) is still
+    // tolerated: the filter coasts on the gyro and stays accurate
+    for (unsigned int k = 0; k < BODY_MEASUREMENT_UPDATE_PERIOD_TICKS; k++) {
+        body_sim_bad_mag_step(&s, nan_mag, NULLPTR, true, false, currents);
+    }
+    check_true(body_is_pointing() && body_get_filter_resets() == 0,
+               "a measurement period of bad magnetometer samples keeps the filter");
+    check_less("attitude error after coasting a measurement period on the gyro (deg)",
+               body_attitude_error_deg(&s), 5.0);
+    body_sim_step(&s, true, 1, currents);
+
+    // A persistent fault resets exactly at BODY_MAG_FAULT_RESET_TICKS
+    for (unsigned int k = 0; k < BODY_MAG_FAULT_RESET_TICKS - 1u; k++) {
+        body_sim_bad_mag_step(&s, zero_mag, NULLPTR, true, false, currents);
+    }
+    check_true(body_is_pointing() && body_get_filter_resets() == 0,
+               "persistent bad magnetometer: still pointing one tick before the limit");
+    body_sim_bad_mag_step(&s, zero_mag, NULLPTR, true, false, currents);
+    check_true(!body_is_pointing() && !body_get_attitude(q_dummy) && body_get_filter_resets() == 1,
+               "persistent bad magnetometer: filter resets once at the limit");
+    body_sim_step(&s, true, 1, currents);
+    check_true(body_is_pointing(), "valid magnetometer after a persistent fault resumes pointing");
+
     // A large rate while pointing is treated as a new tumble or gyro fault.
+    int resets_before_glitch = body_get_filter_resets();
     {
         float m1[3], g1[3], d1[NUM_DIODES];
         body_sim_advance(&s, 1);
@@ -2253,7 +2263,7 @@ void test_body(void) {
     int steps_to_reset = -1;
     for (int k = 0; k < 20; k++) {
         body_sim_step(&s, true, 1, currents);
-        if (body_get_filter_resets() > 0) {
+        if (body_get_filter_resets() > resets_before_glitch) {
             steps_to_reset = k;
             break;
         }
@@ -2543,49 +2553,17 @@ static void parity_pointing(void) {
     if (strlen(ML_USED_SHIMS) > 0) {
         note("pointing_error.m ran with shims for missing toolbox functions: %s (tools/matlab/shims)", ML_USED_SHIMS);
     }
-    double wq = 0, wz = 0;
+    double wq = 0;
     for (int k = 0; k < ML_POINT_IN_N; k++) {
-        float r[3], v[3], qb[4], target[3], q_err[4], z[3], prev[4] = {1, 0, 0, 0};
+        float r[3], v[3], qb[4], target[3], q_err[4], prev[4] = {1, 0, 0, 0};
         to_float(&ML_POINT_IN[k][0], r, 3);
         to_float(&ML_POINT_IN[k][3], v, 3);
         to_float(&ML_POINT_IN[k][6], qb, 4);
         to_float(&ML_POINT_IN[k][10], target, 3);
-        pointing_error(r, v, qb, target, prev, q_err, z);
+        pointing_error(r, v, qb, target, prev, q_err);
         wq = fmax(wq, quat_angle_deg_d(q_err, &ML_POINT_OUT[k][0]));
-        wz = fmax(wz, max_abs_diff(z, &ML_POINT_OUT[k][4], 3));
     }
     check_less("pointing_error q_err == pointing_error.m (deg)", wq, 1e-3);
-    check_less("pointing_error z_want == pointing_error.m", wz, 1e-6);
-}
-
-// C local-frame covariance -> MATLAB global frame: attitude rows/cols rotated by R(q)
-static void local_to_global_cov(const float* P, const float* q, double* out) {
-    float Rm[9];
-    quat2rotm(q, Rm);
-    double T[36] = {0};
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            T[i * 6 + j] = Rm[i * 3 + j];
-        }
-        T[(i + 3) * 6 + (i + 3)] = 1;
-    }
-    double TP[36] = {0};
-    for (int i = 0; i < 6; i++) {
-        for (int j = 0; j < 6; j++) {
-            for (int k = 0; k < 6; k++) {
-                TP[i * 6 + j] += T[i * 6 + k] * P[k * 6 + j];
-            }
-        }
-    }
-    for (int i = 0; i < 6; i++) {
-        for (int j = 0; j < 6; j++) {
-            double acc = 0;
-            for (int k = 0; k < 6; k++) {
-                acc += TP[i * 6 + k] * T[j * 6 + k];
-            }
-            out[i * 6 + j] = acc;
-        }
-    }
 }
 
 typedef struct {
@@ -2622,15 +2600,11 @@ static ukf_step_stats_t run_ukf_steps(const double (*in_tab)[27], const double (
         st.att_diff_deg = fmax(st.att_diff_deg, quat_angle_deg_d(q_new, &e[0]));
         st.bias_diff = fmax(st.bias_diff, max_abs_diff(&x_new[3], &e[4], 3));
         st.max_correction_deg = fmax(st.max_correction_deg, quat_angle_deg_d(q, &e[0]));
-        // MATLAB's covariance is about its mean before the final correction: mean = rv2q(x_hat)^-1 * q_new
-        float x_ml[3], dq_ml[4], dq_inv[4], q_ml[4], mean_ml[4];
-        to_float(&e[43], x_ml, 3);
-        to_float(&e[0], q_ml, 4);
-        rotationvec2quat(x_ml, dq_ml);
-        quat_conj(dq_ml, dq_inv);
-        quat_multiply(dq_inv, q_ml, mean_ml);
+        // The C filter now uses MATLAB's global (ECI-frame) attitude error, so P compares directly
         double Pg[36], dmax = 0, pmax = 0;
-        local_to_global_cov(P_new, mean_ml, Pg);
+        for (int i = 0; i < 36; i++) {
+            Pg[i] = P_new[i];
+        }
         for (int i = 0; i < 36; i++) {
             dmax = fmax(dmax, fabs(Pg[i] - e[7 + i]));
             pmax = fmax(pmax, fabs(e[7 + i]));
@@ -2672,32 +2646,26 @@ static void parity_ukf(void) {
     }
     check_less("get_sigma_points == simulink.m get_sigma_points (same order, non-diagonal P)", wsig, 1e-5);
 
-    // Single steps from identical states. The C filter uses body-frame (local) attitude errors and
-    // adds Q before generating sigma points; simulink.m uses ECI-frame (global) errors and adds Q
-    // after propagation, so its measurement update never sees Q (its posterior keeps all of Q).
-    //  - Q = 0, small prior: the two are the same algorithm to second order -> tight agreement.
-    //  - Q != 0 (the simulink.m tuning): estimates stay close and C's posterior covariance is
-    //    smaller, exactly as that difference predicts.
+    // Single steps from identical states. iterate.c is a line-by-line port of the MATLAB UKF
+    // (global ECI-frame attitude error, Q added after propagation), so the only differences left
+    // are float32 vs double rounding.
     ukf_step_stats_t q0 = run_ukf_steps(ML_UKF_STEPQ0_IN, ML_UKF_STEPQ0_OUT, ML_UKF_STEPQ0_IN_N, 1e-4f, 0.0f);
     check_true(q0.all_ok, "single steps, Q = 0: every C step returns UKF_OK");
-    check_less("single steps, Q = 0: updated attitude C vs simulink.m (deg)", q0.att_diff_deg, 0.002);
+    check_less("single steps, Q = 0: updated attitude C vs simulink.m (deg)", q0.att_diff_deg, 1e-3);
     check_less("single steps, Q = 0: updated gyro bias C vs simulink.m (rad/s)", q0.bias_diff, 1e-6);
-    check_less("single steps, Q = 0: covariance C (rotated to ECI frame) vs simulink.m (relative)", q0.cov_rel_diff, 0.01);
+    check_less("single steps, Q = 0: covariance C vs simulink.m (relative)", q0.cov_rel_diff, 1e-4);
 
     ukf_step_stats_t qs = run_ukf_steps(ML_UKF_STEP_IN, ML_UKF_STEP_OUT, ML_UKF_STEP_IN_N, 0.004f, 1.0f);
     check_true(qs.all_ok, "single steps, simulink.m tuning: every C step returns UKF_OK");
     report_value(true, "single steps, simulink.m tuning: (context) largest attitude change in one MATLAB step", "%.3f deg",
                  qs.max_correction_deg);
-    check_less("single steps, simulink.m tuning: updated attitude C vs simulink.m (deg)", qs.att_diff_deg, 0.1);
-    check_less("single steps, simulink.m tuning: updated gyro bias C vs simulink.m (rad/s)", qs.bias_diff, 2e-5);
-    check_less("single steps, simulink.m tuning: predict-only covariance C vs simulink.m (relative)", qs.cov_rel_diff_predict, 0.01);
+    check_less("single steps, simulink.m tuning: updated attitude C vs simulink.m (deg)", qs.att_diff_deg, 1e-3);
+    check_less("single steps, simulink.m tuning: updated gyro bias C vs simulink.m (rad/s)", qs.bias_diff, 1e-7);
+    check_less("single steps, simulink.m tuning: predict-only covariance C vs simulink.m (relative)", qs.cov_rel_diff_predict, 1e-4);
     check_close("single steps, Q = 0: posterior attitude variance ratio C / simulink.m", q0.trace_ratio_mean, 1.0, 1e-3);
-    // MATLAB's update ignores Q, so it keeps all of Q in the posterior: C should be smaller on
-    // average. Nonlinearity at ~3 deg corrections is the same order as Q here, so individual
-    // steps can go either way by a little.
-    check_less("single steps, simulink.m tuning: mean posterior attitude variance ratio C / simulink.m (< 1)", qs.trace_ratio_mean, 1.0);
-    check_less("single steps, simulink.m tuning: max posterior attitude variance ratio C / simulink.m", qs.trace_ratio_max, 1.02);
-    check_true(qs.trace_ratio_min > 0.8, "single steps, simulink.m tuning: min posterior attitude variance ratio C / simulink.m > 0.8");
+    check_close("single steps, simulink.m tuning: mean posterior attitude variance ratio C / simulink.m", qs.trace_ratio_mean, 1.0, 1e-3);
+    check_less("single steps, simulink.m tuning: max posterior attitude variance ratio C / simulink.m", qs.trace_ratio_max, 1.001);
+    check_true(qs.trace_ratio_min > 0.999, "single steps, simulink.m tuning: min posterior attitude variance ratio C / simulink.m > 0.999");
 
     // Full trajectory: 2 min at 10 Hz, updates every 5th step, magnetometer-only for the second half
     const double* setup = ML_TRAJ_SETUP[0];
@@ -2758,18 +2726,16 @@ static void parity_ukf(void) {
         }
     }
     check_true(all_ok, "trajectory: every C step returns UKF_OK");
-    check_less("trajectory, sun + mag: max C vs simulink.m attitude difference after 10 s (deg)", w_vs_ml_sun, 0.05);
-    // Magnetometer only: rotation about the field is only weakly observable, so the two filters'
-    // errors wander independently along it (both stay ~0.5 deg from the truth, checked below)
-    check_less("trajectory, mag only: max C vs simulink.m attitude difference (deg)", w_vs_ml_ecl, 1.0);
-    check_less("trajectory: max C vs simulink.m gyro bias difference (rad/s)", w_bias, 2e-4);
+    check_less("trajectory, sun + mag: max C vs simulink.m attitude difference after 10 s (deg)", w_vs_ml_sun, 0.01);
+    check_less("trajectory, mag only: max C vs simulink.m attitude difference (deg)", w_vs_ml_ecl, 0.01);
+    check_less("trajectory: max C vs simulink.m gyro bias difference (rad/s)", w_bias, 1e-5);
     const char* phase_name[2] = {"sun + mag", "mag only"};
     for (int ph = 0; ph < 2; ph++) {
         double c_mean = c_sum[ph] / n_sum[ph], ml_mean = ml_sum[ph] / n_sum[ph];
         char name[160];
         snprintf(name, sizeof(name), "trajectory, %s: C mean error minus MATLAB mean error (deg; C %.3f, MATLAB %.3f)",
                  phase_name[ph], c_mean, ml_mean);
-        check_less(name, c_mean - ml_mean, 0.1);
+        check_less(name, fabs(c_mean - ml_mean), 0.01);
     }
 }
 

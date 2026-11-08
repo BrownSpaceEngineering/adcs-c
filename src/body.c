@@ -1,13 +1,14 @@
 #include "include/body.h"
 #include "arm_math.h"
 #include "include/bdot.h"
-#include "include/down_quat.h"
+#include "include/pointing_error.h"
 #include "include/ecef2eci.h"
 #include "include/iterate.h"
 #include "include/laextension.h"
 #include "include/magnetosphere.h"
 #include "include/moments2currents.h"
 #include "include/pd.h"
+#include "include/newpointing.h"
 #include "include/photodiode_determination.h"
 #include "include/quat.h"
 #include "include/quest.h"
@@ -16,12 +17,19 @@
 #include "include/torque2moments.h"
 #include "math.h"
 #include "string.h"
+#include <limits.h>
+
+//U9: +y, U8: +x, U10: -z
+//NEED TO CHECK WITH FLIGHT SOFTWARE
 
 // Providence, lla2ecef(41.825226, -71.418884, 0) (see eceftoeci.m)
 float PVD_ECEF[3] = {6.3761e6f, -0.1387e6f, 0.0807e6f};
-const float DETUMBLING_GYRO_THRESHOLD = 0.17f; // rad/s
-const float DETUMBLING_MAG_THRESHOLD = 0.01f;  // |dB/dt|, T/s. TODO: tune (anything in T/s passes)
-const float BDOT_GAIN = 1.0f;                  // TODO: tune (placeholder like the MATLAB k)
+const float DETUMBLING_GYRO_THRESHOLD = 0.005; // rad/s (~4-5x orbit rate; pointing failed to converge from 0.014)
+const float DETUMBLING_MAG_THRESHOLD = 4e-7f;  // |dB/dt|, T/s. TODO: tune (anything in T/s passes)
+// B-dot gain for m = -k dB/dt (A m^2 per T/s). Sized from the optimal-gain result
+// k* = 2 w_orb (1 + sin xi_m) J_min / |B|^2 (Avanzini & Giulietti 2012) with w_orb = 1.07e-3 rad/s,
+// xi_m ~ 60 deg, J_min = 0.0124 kg m^2, |B| ~ 30 uT -> ~5e4. Saturates the coils above ~0.3 rad/s.
+const float BDOT_GAIN = 5e4f;
 const float* Imax = NULLPTR;                     // NULLPTR uses hardware defaults (see moments2currents.c)
 
 // Filter tuning. Measurement vectors are unit vectors, so R is in (unit vector)^2.
@@ -31,17 +39,22 @@ const float INIT_P[6 * 6] = {
     0.01f, 0,     0,     0,       0,       0,
     0,     0.01f, 0,     0,       0,       0,
     0,     0,     0.01f, 0,       0,       0,
-    0,     0,     0,     2.5e-5f, 0,       0,
-    0,     0,     0,     0,       2.5e-5f, 0,
-    0,     0,     0,     0,       0,       2.5e-5f};
-// Process noise per second (multiplied by dt each step)
+    0,     0,     0,     3.05e-6f, 0,       0,
+    0,     0,     0,     0,       3.05e-6f, 0,
+    0,     0,     0,     0,       0,       3.05e-6f};
+// Process noise per second (multiplied by dt each step). Spectral densities for the
+// Murata SCH16T-K01, inflated to cover unmodelled errors (field-model mismatch, albedo,
+// scale factor/misalignment, thermal bias drift) and to keep P well above the float32 /
+// SIGMA_JITTER floor:
+//   attitude: ARW 0.4 mdps/rtHz -> sigma_v^2 = 5e-11 rad^2/s; use 1e-8 (tune 1e-8..1e-7)
+//   bias:     BI 0.5 deg/h -> sigma_u^2 ~ 2e-14 rad^2/s^3;      use 1e-12 (tune 1e-13..1e-11)
 const float Q_RATE[6 * 6] = {
-    4e-5f, 0,     0,     0,     0,     0,
-    0,     4e-5f, 0,     0,     0,     0,
-    0,     0,     4e-5f, 0,     0,     0,
-    0,     0,     0,     1e-9f, 0,     0,
-    0,     0,     0,     0,     1e-9f, 0,
-    0,     0,     0,     0,     0,     1e-9f};
+    1e-8f, 0,     0,     0,      0,      0,
+    0,     1e-8f, 0,     0,      0,      0,
+    0,     0,     1e-8f, 0,      0,      0,
+    0,     0,     0,     1e-12f, 0,      0,
+    0,     0,     0,     0,      1e-12f, 0,
+    0,     0,     0,     0,      0,      1e-12f};
 // [magnetometer (3), photodiode sun vector (3)]
 const float R_IN_SUN[6 * 6] = {
     4e-4f, 0,     0,     0,       0,       0,
@@ -65,7 +78,7 @@ const float R_IN_SHADOW[3 * 3] = {
 #define MAX_INNOVATION_RAD 0.45f
 #define MAX_INNOVATION_STRIKES 5
 // A rate above this while pointing indicates a new tumble or a gyro fault.
-#define MAX_POINTING_RATE_RAD_S 1.0f
+#define MAX_POINTING_RATE_RAD_S 0.2f
 
 // ---- Module state (previously `static` in body.h, which gave every includer its own copy) ----
 static float tle_mean[6];
@@ -88,6 +101,14 @@ static bool attitude_initialized = false;
 static int filter_resets = 0;
 static int innovation_strikes = 0;
 static unsigned int pointing_tick = 0;
+static unsigned int mag_fault_ticks = 0; // consecutive ticks with an unusable magnetometer sample
+static unsigned int gyro_fault_ticks = 0; // consecutive ticks with a non-finite gyro sample
+static unsigned int ready_ticks = 0;      // consecutive ticks the detumble -> pointing check passed
+static float dbdt_filt[3];                // low-passed dB/dt (T/s) for the hand-off check
+static bool dbdt_filt_valid = false;
+// Time (s) since the filter was last propagated. Accumulates every pointing tick and is consumed by
+// the next UKF step, so ticks skipped by an early return (bad gyro, etc.) aren't lost.
+static float unpropagated_s = 0.0f;
 
 static const float ZERO3[3] = {0, 0, 0};
 
@@ -115,6 +136,11 @@ void body_reset(void) {
     filter_resets = 0;
     innovation_strikes = 0;
     pointing_tick = 0;
+    mag_fault_ticks = 0;
+    gyro_fault_ticks = 0;
+    unpropagated_s = 0.0f;
+    ready_ticks = 0;
+    dbdt_filt_valid = false;
 }
 
 bool body_set_tle_metadata(float bstar, double epoch_jd) {
@@ -172,6 +198,11 @@ static void reset_filter_to_detumble(void) {
     pointing = false;
     innovation_strikes = 0;
     pointing_tick = 0;
+    mag_fault_ticks = 0;
+    gyro_fault_ticks = 0;
+    unpropagated_s = 0.0f;
+    ready_ticks = 0;
+    dbdt_filt_valid = false;
     filter_resets++;
 }
 
@@ -232,9 +263,15 @@ static bool mag_ok(const float* measurement) {
 }
 
 /**
- * True when rates are low enough to stop detumbling and we can see the sun (needed for QUEST).
+ * True when it's safe to stop detumbling: the gyro rate AND the low-passed |dB/dt| are both under
+ * their thresholds, the sun is visible (QUEST needs it), and all of that has held for
+ * BODY_READY_TO_POINT_TICKS consecutive ticks. Any failing tick resets the count.
  *
- * Fixes vs the previous version: dB used last_mag[2] for the y and z components (and mag[1] for
+ * Why both, and why debounced: with an OR, a single noisy dB/dt sample under the threshold (or a
+ * spin about the field line, where dB/dt ~ 0 at any rate) handed over to pointing at 0.25 rad/s.
+ * The low-pass keeps magnetometer noise in dB/dt well under the threshold.
+ *
+ * Fixes vs the original version: dB used last_mag[2] for the y and z components (and mag[1] for
  * z), and was multiplied by dt instead of divided.
  */
 static bool ready_to_point(const float* photodiode_measurements, const float* gyro,
@@ -242,17 +279,32 @@ static bool ready_to_point(const float* photodiode_measurements, const float* gy
                            const float* magnetometer_measurements, float dt) {
     if (gyro == NULLPTR || photodiode_measurements == NULLPTR || !(dt > 0.0f)
         || !mag_ok(last_magnetometer_measurements) || !mag_ok(magnetometer_measurements)) {
+        ready_ticks = 0;
         return false;
     }
     float dM[3];
     for (int i = 0; i < 3; i++) {
         dM[i] = (magnetometer_measurements[i] - last_magnetometer_measurements[i]) / dt;
     }
+    if (!dbdt_filt_valid) {
+        memcpy(dbdt_filt, dM, sizeof(dbdt_filt));
+        dbdt_filt_valid = true;
+    } else {
+        for (int i = 0; i < 3; i++) {
+            dbdt_filt[i] += BODY_DBDT_FILTER_ALPHA * (dM[i] - dbdt_filt[i]);
+        }
+    }
     float photodiode_sun_vec[3];
     bool in_sun = get_vec_from_photodiode_readings(photodiode_measurements, photodiode_sun_vec);
 
-    return (l2_norm(dM, 3) < DETUMBLING_MAG_THRESHOLD || l2_norm(gyro, 3) < DETUMBLING_GYRO_THRESHOLD)
-           && in_sun;
+    bool calm = l2_norm(dbdt_filt, 3) < DETUMBLING_MAG_THRESHOLD
+                && l2_norm(gyro, 3) < DETUMBLING_GYRO_THRESHOLD;
+    if (calm && in_sun) {
+        if (ready_ticks < UINT_MAX) ready_ticks++;
+    } else {
+        ready_ticks = 0;
+    }
+    return ready_ticks >= BODY_READY_TO_POINT_TICKS;
 }
 
 static bool valid_tle_mean(const float* elements) {
@@ -278,23 +330,40 @@ void body(const float* last_magnetometer_measurements, // 1x3
     if (output_currents != NULLPTR) zero_currents(output_currents);
     else return;
 
-    // Bad magnetometer data: drop back to detumbling and bail
-    if (!mag_ok(last_magnetometer_measurements) || !mag_ok(magnetometer_measurements)) {
-        if (pointing) reset_filter_to_detumble();
+    // Bail on null pointers or bad dt
+    if (gyro_measurements == NULLPTR || photodiode_measurements == NULLPTR || !(dt > 0.0f)
+        || !isfinite(dt)) {
         return;
     }
-    // Bail on null pointers, bad dt, or non-finite gyro
-    if (output_currents == NULLPTR || gyro_measurements == NULLPTR
-        || photodiode_measurements == NULLPTR || !(dt > 0.0f)
-        || !isfinite(dt) || !all_finite(gyro_measurements, 3)) {
-        return;
-    }
+    // While pointing, this tick's dt is owed to the filter even if we return before propagating
+    if (pointing) unpropagated_s += dt;
 
-    // Unit-vector the measured field; a zero-length reading is unusable
-    float mag_body_unit[3] = {magnetometer_measurements[0], magnetometer_measurements[1],
-                              magnetometer_measurements[2]};
-    if (!normalize_vec(mag_body_unit, 3)) {
-        if (pointing) reset_filter_to_detumble();
+    // Non-finite gyro: skip the tick. A short gap is bridged by the next good tick (which
+    // propagates over unpropagated_s); a long one means the gyro is gone, so stop pointing.
+    if (!all_finite(gyro_measurements, 3)) {
+        if (pointing && ++gyro_fault_ticks >= BODY_GYRO_FAULT_RESET_TICKS) {
+            reset_filter_to_detumble();
+        }
+        return;
+    }
+    gyro_fault_ticks = 0;
+
+    // Magnetometer health. While pointing only the current sample matters (the previous one is
+    // only used by B-dot / ready_to_point), and a bad sample is tolerated: the filter coasts on
+    // the gyro and control uses the WMM field. Only a persistent fault resets the filter.
+    float mag_body_unit[3] = {0.0f, 0.0f, 0.0f};
+    bool mag_valid = mag_ok(magnetometer_measurements);
+    if (mag_valid) {
+        memcpy(mag_body_unit, magnetometer_measurements, sizeof(mag_body_unit));
+        mag_valid = normalize_vec(mag_body_unit, 3);
+    }
+    if (mag_valid) {
+        mag_fault_ticks = 0;
+    } else if (mag_fault_ticks < UINT_MAX) {
+        mag_fault_ticks++;
+    }
+    if (pointing && mag_fault_ticks >= BODY_MAG_FAULT_RESET_TICKS) {
+        reset_filter_to_detumble();
         return;
     }
 
@@ -353,6 +422,9 @@ void body(const float* last_magnetometer_measurements, // 1x3
     // Measured / expected normalized unit vectors.
     float mag_ref_unit[3] = {expected_mag[0], expected_mag[1], expected_mag[2]};
     // If degenerate model field, bail
+
+    //THIS CHECKS LITERALLY 0 --> then stops if 0
+
     if (!normalize_vec(mag_ref_unit, 3)) {
         if (pointing) reset_filter_to_detumble();
         return;
@@ -360,6 +432,9 @@ void body(const float* last_magnetometer_measurements, // 1x3
 
     // During detumbling...
     if (!pointing) {
+        // B-dot and ready_to_point need both samples; no filter state to lose by skipping a tick
+        if (!mag_valid || !mag_ok(last_magnetometer_measurements)) return;
+
         // Case 1: Measurements tell us to stop detumbling
         if (ready_to_point(photodiode_measurements, gyro_measurements,
                            last_magnetometer_measurements, magnetometer_measurements, dt)) {
@@ -421,8 +496,8 @@ void body(const float* last_magnetometer_measurements, // 1x3
     float ref_vecs[6] = {mag_ref_unit[0], mag_ref_unit[1], mag_ref_unit[2], 0, 0, 0};
     int num_vecs;
     const float* R;
-    if (!do_update) {
-        num_vecs = 0; // scheduled gyro propagation between measurement ticks
+    if (!do_update || !mag_valid) {
+        num_vecs = 0; // gyro propagation only (between measurement ticks, or a bad magnetometer)
         R = NULLPTR;
     } else if (in_sun) {
         // Sunlit: use both magnetometer and sun vectors
@@ -440,10 +515,14 @@ void body(const float* last_magnetometer_measurements, // 1x3
         R = R_IN_SHADOW;
     }
 
-    // Scale process noise by the timestep
+    // Propagate over everything since the last UKF step (normally dt; longer after skipped ticks)
+    float dt_prop = unpropagated_s;
+    unpropagated_s = 0.0f;
+
+    // Scale process noise by the propagation time
     float Q_step[6 * 6];
     for (int i = 0; i < 36; i++) {
-        Q_step[i] = Q_RATE[i] * dt;
+        Q_step[i] = Q_RATE[i] * dt_prop;
     }
 
     // Predict every tick, with only every K-th tick being a predict + correction tick.
@@ -451,11 +530,11 @@ void body(const float* last_magnetometer_measurements, // 1x3
     float new_estimated_quat[4];
     float new_P[6 * 6];
     ukf_status_t status = iterate(error_quat_state, estimated_quat, error_quat_cov, body_vecs, ref_vecs,
-                                  num_vecs, gyro_measurements, Q_step, R, dt, new_error_state,
+                                  num_vecs, gyro_measurements, Q_step, R, dt_prop, new_error_state,
                                   new_estimated_quat, new_P);
 
     // Filter errored or produced a bad estimate
-    if (status != UKF_OK || filter_failure(new_estimated_quat, gyro_measurements, new_P, dt)) {
+    if (status != UKF_OK || filter_failure(new_estimated_quat, gyro_measurements, new_P, dt_prop)) {
         // Reset everything and return to detumbling just in case
         reset_filter_to_detumble();
         return;
@@ -487,17 +566,6 @@ void body(const float* last_magnetometer_measurements, // 1x3
 
     // ---- Control: pointing_error.m -> PD_loop.m -> torque2moment3axis.m -> moment2current3axis.m
     // Target ground location in ECI
-    float pvd_eci[3];
-    ecef_2_eci(PVD_ECEF, pvd_eci, unix_time);
-
-    // Body-frame error quaternion. (The old code used goal * est^-1, an ECI-frame error, and
-    // fed it to a controller that works in body coordinates.)
-    float q_err[4];
-    // No valid pointing solution: coast with the coils off
-    if (!pointing_error(r_eci, v_eci, estimated_quat, pvd_eci, q_want_prev, q_err, NULLPTR)) {
-        command_zero_moment(output_currents);
-        return;
-    }
 
     // Bias-corrected angular rate
     float omega[3];
@@ -506,13 +574,9 @@ void body(const float* last_magnetometer_measurements, // 1x3
     }
 
     // PD torque command
-    float t[3];
-    pd_loop(q_err, omega, t);
-
-    // Torque -> magnetic moment (perpendicular to the measured field)
-    float m[3];
-    torque_2_moments(magnetometer_measurements, t, m);
+    float m_out[3];
+    new_pd(r_eci, v_eci, estimated_quat, expected_mag, omega, m_out);
 
     // Moment -> coil currents
-    moment2current3axis(m, Imax, output_currents);
+    moment2current3axis(m_out, Imax, output_currents);
 }

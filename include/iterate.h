@@ -4,7 +4,8 @@
 #include <stdbool.h>
 
 // Multiplicative UKF on [attitude error rotation vector (3), gyro bias (3)].
-// Attitude errors are LOCAL (body frame): q_sigma = q_est * dq(err).
+// Exact port of the Simulink block UKF. Attitude errors are GLOBAL (ECI frame):
+// q_sigma = dq(err) * q_est; propagation is q * dq((gyro - bias) dt).
 #define STATE_SIZE 6
 #define MAX_MSMT_VECS 2
 #define MAX_MSMT_SIZE (3 * MAX_MSMT_VECS)
@@ -43,7 +44,7 @@ typedef enum {
  * body, ref    [3*num_vecs] measured body-frame vectors and the matching ref-frame vectors
  * num_vecs     0 = predict only, 1 or 2 vectors otherwise
  * gyro         [3]      raw gyro measurement (rad/s, body frame)
- * Q            [6x6]    process noise added to cov before sigma point generation
+ * Q            [6x6]    process noise added to the propagated covariance (P_hat + Q)
  * R            [(3*num_vecs)^2] measurement noise (unused when num_vecs == 0)
  *
  * Outputs may alias inputs. On failure outputs are copies of the inputs.
@@ -60,6 +61,6 @@ void get_weights(float32_t lambda, int n, float32_t alpha, float32_t beta, float
                  float32_t* mean_weights);
 // sigmas is NUM_SIGMAS rows x STATE_SIZE. Returns false if P can't be factored.
 bool get_sigma_points(float32_t lam, const float32_t* state, const float32_t* P, float32_t* sigmas);
-// Symmetrizes P (n x n, n <= STATE_SIZE) and adds diagonal jitter until it is positive definite.
+// Port of ensure_positive_definite: symmetrize P (n x n, n <= STATE_SIZE); if min eig < 1e-9 shift the diagonal.
 bool ensure_psd(float32_t* P, int n);
 #endif

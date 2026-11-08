@@ -18,7 +18,7 @@ list(FILTER SRC EXCLUDE REGEX "/Source/[^/]+/arm_[^/]*\\.c$")
 # not standalone translation units, and fail to compile on their own
 list(FILTER SRC EXCLUDE REGEX "/_[^/]*\\.c$")
 # manual specified sources:
-set(ADCS_SRC src/main.c src/test.c src/quat.c src/laextension.c src/bdot.c src/body.c src/down_quat.c src/ecef2eci.c src/filters.c src/iterate.c src/kepler.c src/magnetosphere.c src/moments2currents.c src/orbital2eci.c src/pd.c src/photodiode_determination.c src/quest.c src/sunvec.c src/torque2moments.c src/sgp4_init.c src/sgp4_propagate.c src/sgp4_step.c)
+set(ADCS_SRC src/main.c src/test.c src/quat.c src/laextension.c src/bdot.c src/body.c src/pointing_error.c src/ecef2eci.c src/filters.c src/iterate.c src/kepler.c src/magnetosphere.c src/moments2currents.c src/orbital2eci.c src/pd.c src/photodiode_determination.c src/quest.c src/sunvec.c src/torque2moments.c src/sgp4_init.c src/sgp4_propagate.c src/sgp4_step.c src/newpointing.c)
 list(APPEND SRC ${ADCS_SRC})
 # extra warnings on our own code only (CMSIS is noisy). -Wshadow / -Wfloat-equal match the PVDX
 # firmware build, which compiles with -Werror.
@@ -42,6 +42,17 @@ target_include_directories(${EXECUTABLE} PRIVATE linalg
 target_link_libraries(adcs-test m)
 
 target_compile_definitions(${EXECUTABLE} PRIVATE __GNUC_PYTHON__)
+
+# Host closed loop / PIL plant (tools/plant_sim.c + src/plant.c). Ground-side only: plant.c and
+# tle_fit.c are excluded from the firmware build in adcs.mk.
+set(PLANT_SRC ${SRC})
+list(REMOVE_ITEM PLANT_SRC src/main.c src/test.c)
+list(APPEND PLANT_SRC src/plant.c src/tle_fit.c tools/plant_sim.c)
+set_source_files_properties(src/plant.c src/tle_fit.c tools/plant_sim.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wshadow;-Wfloat-equal")
+add_executable(adcs-plant-sim ${PLANT_SRC})
+target_include_directories(adcs-plant-sim PRIVATE . linalg linalg/Include linalg/PrivateInclude)
+target_link_libraries(adcs-plant-sim m)
+target_compile_definitions(adcs-plant-sim PRIVATE __GNUC_PYTHON__)
 
 # expose headers in an include directory if desired:
 # target_include_directories(${EXECUTABLE} PUBLIC include)

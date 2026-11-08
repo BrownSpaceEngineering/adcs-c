@@ -23,6 +23,19 @@ extern const float R_IN_SHADOW[3 * 3];
     || BODY_MAGNETORQUER_QUIET_START_TICK > BODY_MEASUREMENT_UPDATE_PERIOD_TICKS
 #error "Magnetorquer quiet start must be within the measurement cycle"
 #endif
+/* Consecutive bad magnetometer ticks tolerated while pointing before the filter is reset.
+ * Shorter runs are treated as glitches: the filter coasts on the gyro and skips the update. */
+#define BODY_MAG_FAULT_RESET_TICKS (3u * BODY_MEASUREMENT_UPDATE_PERIOD_TICKS)
+/* Consecutive non-finite gyro ticks tolerated while pointing before the filter is reset.
+ * Shorter gaps are bridged: the next good tick propagates over the whole gap. */
+#define BODY_GYRO_FAULT_RESET_TICKS 100u
+/* Detumble -> pointing hand-off. Both |gyro| and the low-passed |dB/dt| must stay under their
+ * thresholds (with the sun visible) for this many consecutive ticks; any tick that fails resets
+ * the count. */
+#define BODY_READY_TO_POINT_TICKS 50u
+/* First-order low-pass on dB/dt used by the hand-off check (alpha per tick; 0.1 at 10 Hz is a
+ * ~1 s time constant and cuts magnetometer noise in dB/dt by ~4.4x). */
+#define BODY_DBDT_FILTER_ALPHA 0.1f
 
 /**
  * One ADCS step.
