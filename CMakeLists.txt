@@ -43,5 +43,16 @@ target_link_libraries(adcs-test m)
 
 target_compile_definitions(${EXECUTABLE} PRIVATE __GNUC_PYTHON__)
 
+# Host closed loop / PIL plant (tools/plant_sim.c + src/plant.c). Ground-side only: plant.c and
+# tle_fit.c are excluded from the firmware build in adcs.mk.
+set(PLANT_SRC ${SRC})
+list(REMOVE_ITEM PLANT_SRC src/main.c src/test.c)
+list(APPEND PLANT_SRC src/plant.c src/tle_fit.c tools/plant_sim.c)
+set_source_files_properties(src/plant.c src/tle_fit.c tools/plant_sim.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wshadow;-Wfloat-equal")
+add_executable(adcs-plant-sim ${PLANT_SRC})
+target_include_directories(adcs-plant-sim PRIVATE . linalg linalg/Include linalg/PrivateInclude)
+target_link_libraries(adcs-plant-sim m)
+target_compile_definitions(adcs-plant-sim PRIVATE __GNUC_PYTHON__)
+
 # expose headers in an include directory if desired:
 # target_include_directories(${EXECUTABLE} PUBLIC include)

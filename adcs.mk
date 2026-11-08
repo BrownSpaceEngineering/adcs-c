@@ -12,8 +12,9 @@ ifeq ($(wildcard $(ADCS_DIR)/linalg/Include/arm_math.h),)
     $(error CMSIS-DSP not found in $(ADCS_DIR)/linalg. Run 'git submodule update --init --recursive')
 endif
 
-# main.c and test.c are the host test runner, not part of the library
-ADCS_LIB_SRCS := $(filter-out $(ADCS_DIR)/src/main.c $(ADCS_DIR)/src/test.c,$(wildcard $(ADCS_DIR)/src/*.c))
+# main.c and test.c are the host test runner, not part of the library;
+# plant.c / tle_fit.c are the ground-side PIL plant, not flight code
+ADCS_LIB_SRCS := $(filter-out $(ADCS_DIR)/src/main.c $(ADCS_DIR)/src/test.c $(ADCS_DIR)/src/plant.c $(ADCS_DIR)/src/tle_fit.c,$(wildcard $(ADCS_DIR)/src/*.c))
 
 # CMSIS-DSP: cmsis_dsp/ has one wrapper per Source/<Group>/<Group>.c amalgamation (the same files
 # CMakeLists.txt compiles, minus F16, which the Cortex-M4 has no FPU for). The wrappers silence

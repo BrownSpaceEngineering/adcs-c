@@ -60,17 +60,26 @@ bool get_vec_from_photodiode_readings(const float* photodiode_readings,
 
         int brighter_index;
         float brighter_reading;
+        bool ok0 = isfinite(photodiode_readings[i0]);
+        bool ok1 = isfinite(photodiode_readings[i1]);
 
-        if (!isfinite(photodiode_readings[i0]) || !isfinite(photodiode_readings[i1])) {
-            return false;
-        }
-
-        if (photodiode_readings[i0] >= photodiode_readings[i1]) {
-            brighter_index = i0;
-            brighter_reading = photodiode_readings[i0];
+        if (ok0 && ok1) {
+            if (photodiode_readings[i0] >= photodiode_readings[i1]) {
+                brighter_index = i0;
+                brighter_reading = photodiode_readings[i0];
+            } else {
+                brighter_index = i1;
+                brighter_reading = photodiode_readings[i1];
+            }
+        } else if (ok0 || ok1) {
+            // One diode of the pair is bad. The pair faces opposite ways, so if the good one is lit
+            // it must be the sunward one. If it's dark we can't tell (the bad one may be the lit
+            // one), so drop the pair rather than feed a wrong zero into the fit.
+            brighter_index = ok0 ? i0 : i1;
+            brighter_reading = photodiode_readings[brighter_index];
+            if (!(brighter_reading > MIN_READING)) continue;
         } else {
-            brighter_index = i1;
-            brighter_reading = photodiode_readings[i1];
+            continue; // both bad: skip the pair
         }
 
         if(brighter_reading > MIN_READING){
@@ -94,12 +103,25 @@ bool get_vec_from_photodiode_readings(const float* photodiode_readings,
         return false;
     }
 
+    // Skipped pairs can leave empty slots; compact the selection and fit with what's there
+    int n_sel = 0;
+    for (int i = 0; i < NUM_SELECTED_DIODES; i++) {
+        if (selected_indices[i] >= 0) {
+            selected_indices[n_sel] = selected_indices[i];
+            selected_readings[n_sel] = selected_readings[i];
+            n_sel++;
+        }
+    }
+    if (n_sel < 3) {
+        return false;
+    }
+
     // Construct system of equations
 
     float32_t A[NUM_SELECTED_DIODES * 3];
     float32_t b[NUM_SELECTED_DIODES];
 
-    for (int i = 0; i < NUM_SELECTED_DIODES; i++) {
+    for (int i = 0; i < n_sel; i++) {
         int diode_index = selected_indices[i];
 
         A[i * 3 + 0] = PHOTODIODES[diode_index][0];
@@ -110,10 +132,10 @@ bool get_vec_from_photodiode_readings(const float* photodiode_readings,
     }
 
     // Least-squares solve via normal equations: x = (A^T A)^-1 A^T b
-    arm_matrix_instance_f32 A_mat = {NUM_SELECTED_DIODES, 3, A};
+    arm_matrix_instance_f32 A_mat = {(uint16_t)n_sel, 3, A};
 
     float32_t A_T[3 * NUM_SELECTED_DIODES];
-    arm_matrix_instance_f32 A_T_mat = {3, NUM_SELECTED_DIODES, A_T};
+    arm_matrix_instance_f32 A_T_mat = {3, (uint16_t)n_sel, A_T};
     arm_mat_trans_f32(&A_mat, &A_T_mat);
 
     float32_t AtA[3 * 3];
@@ -129,7 +151,7 @@ bool get_vec_from_photodiode_readings(const float* photodiode_readings,
 
     float32_t Atb[3];
     arm_matrix_instance_f32 Atb_mat = {3, 1, Atb};
-    arm_matrix_instance_f32 b_mat = {NUM_SELECTED_DIODES, 1, b};
+    arm_matrix_instance_f32 b_mat = {(uint16_t)n_sel, 1, b};
     arm_mat_mult_f32(&A_T_mat, &b_mat, &Atb_mat);
 
     arm_matrix_instance_f32 result_mat = {3, 1, estimated_sun_vector};
