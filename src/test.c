@@ -17,6 +17,7 @@
 #include "include/photodiode_determination.h"
 #include "include/quat.h"
 #include "include/quest.h"
+#include "include/sensor_frames.h"
 #include "include/sgp4_step.h"
 #include "include/sunvec.h"
 #include "include/torque2moments.h"
@@ -281,6 +282,7 @@ int test_run_all(void) {
     test_photodiodes();
     test_pointing();
     test_filters();
+    test_sensor_frames();
     test_body();
     test_matlab_parity();
 
@@ -1952,6 +1954,70 @@ void test_filters(void) {
 }
 
 // =============================================================================================
+// Sensor axes -> body frame (sensor_frames.c)
+// =============================================================================================
+static bool is_signed_permutation(const sensor_axis_map_t* m) {
+    bool seen[3] = {false, false, false};
+    for (int i = 0; i < 3; i++) {
+        if (m->axis[i] < 0 || m->axis[i] > 2 || seen[m->axis[i]]) return false;
+        seen[m->axis[i]] = true;
+        if (!exactly(fabsf(m->sign[i]), 1.0f)) return false;
+    }
+    return true;
+}
+
+// det of the 3x3 matrix M[i][axis[i]] = sign[i]: sign product times the permutation's parity
+static float signed_permutation_det(const sensor_axis_map_t* m) {
+    int inversions = 0;
+    for (int i = 0; i < 3; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            if (m->axis[i] > m->axis[j]) inversions++;
+        }
+    }
+    float det = (inversions % 2) ? -1.0f : 1.0f;
+    for (int i = 0; i < 3; i++) det *= m->sign[i];
+    return det;
+}
+
+void test_sensor_frames(void) {
+    begin_suite("sensor axes -> body frame");
+    const float raw[3] = {1.0f, 2.0f, 3.0f};
+    float out[3], back[3];
+
+    // Hardware table: body = (U8, U9, -U10)
+    mag_sensor_to_body(raw, out);
+    const float mag_expected[3] = {1.0f, 2.0f, -3.0f};
+    check_vec_close("magnetometer [U8,U9,U10] = (1,2,3) -> body (1,2,-3)", out, mag_expected, 3, 0);
+
+    // Hardware table: body = (-gyro_y, -gyro_x, -gyro_z)
+    gyro_sensor_to_body(raw, out);
+    const float gyro_expected[3] = {-2.0f, -1.0f, -3.0f};
+    check_vec_close("gyro (1,2,3) -> body (-2,-1,-3)", out, gyro_expected, 3, 0);
+
+    // Round trips are exact both ways
+    const float body_v[3] = {0.3f, -1.7f, 2.5f};
+    mag_body_to_sensor(body_v, out);
+    mag_sensor_to_body(out, back);
+    check_vec_close("magnetometer body -> sensor -> body is exact", back, body_v, 3, 0);
+    gyro_body_to_sensor(body_v, out);
+    gyro_sensor_to_body(out, back);
+    check_vec_close("gyro body -> sensor -> body is exact", back, body_v, 3, 0);
+    gyro_sensor_to_body(raw, out);
+    gyro_body_to_sensor(out, back);
+    check_vec_close("gyro sensor -> body -> sensor is exact", back, raw, 3, 0);
+
+    check_true(is_signed_permutation(&MAG_SENSOR_TO_BODY), "magnetometer map is a signed permutation (orthonormal)");
+    check_true(is_signed_permutation(&GYRO_SENSOR_TO_BODY), "gyro map is a signed permutation (orthonormal)");
+    // A single 3-axis gyro chip can't be mirrored: its map must be a proper rotation
+    check_true(exactly(signed_permutation_det(&GYRO_SENSOR_TO_BODY), 1.0f), "gyro map is a proper rotation (det +1)");
+
+    // A NaN on one axis stays on the axis it maps to
+    const float nan_raw[3] = {NAN, 2.0f, 3.0f};
+    gyro_sensor_to_body(nan_raw, out);
+    check_true(isfinite(out[0]) && isnan(out[1]) && isfinite(out[2]), "gyro: NaN on raw X lands only on body Y");
+}
+
+// =============================================================================================
 // Full ADCS step (body.c)
 // =============================================================================================
 typedef struct {
@@ -1988,7 +2054,8 @@ static void body_sim_init(body_sim_t* s) {
     s->tle_bstar = 0.0;
 }
 
-// Sensor readings consistent with the truth state
+// Sensor readings consistent with the truth state. Like the hardware, mag and gyro come out in
+// SENSOR axes (sensor_frames.h); s->omega / s->gyro_bias / q_true are body-frame truth.
 static void body_sim_sensors(body_sim_t* s, bool sunlit, float* mag, float* gyro, float* diodes) {
     float r[3], b_eci[3], sun_eci[3], sun_body[3];
     float r_km[3], v_km_s[3], oe_osc[7];
@@ -2003,11 +2070,14 @@ static void body_sim_sensors(body_sim_t* s, bool sunlit, float* mag, float* gyro
     }
     for (int i = 0; i < 3; i++) r[i] = (float)(1000.0 * r_km[i]);
     wmm_eci_embedded_v2(r, s->jd_int, (float)s->jd_frac, b_eci);
-    ref_rotate_inv(s->q_true, b_eci, mag);
+    float mag_body[3], gyro_body[3];
+    ref_rotate_inv(s->q_true, b_eci, mag_body);
     for (int i = 0; i < 3; i++) {
-        mag[i] += normal_sample(0, 5e-8f); // 50 nT noise
-        gyro[i] = s->omega[i] + s->gyro_bias[i] + normal_sample(0, 2e-4f);
+        mag_body[i] += normal_sample(0, 5e-8f); // 50 nT noise
+        gyro_body[i] = s->omega[i] + s->gyro_bias[i] + normal_sample(0, 2e-4f);
     }
+    mag_body_to_sensor(mag_body, mag);
+    gyro_body_to_sensor(gyro_body, gyro);
     sun_vec(s->unix_time, sun_eci);
     ref_rotate_inv(s->q_true, sun_eci, sun_body);
     if (sunlit) {
@@ -2110,13 +2180,18 @@ void test_body(void) {
     check_vec_close("TLE without metadata (epoch, B*) is rejected -> zero currents", currents, zero, 3, 0);
     body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
     body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
-    float dipole[3], expected[3];
+    // mag / mag_prev are raw [U8, U9, U10]; B-dot acts on the body-frame field (U10 flipped)
+    float dipole[3], expected[3], mag_body[3], mag_prev_body[3];
+    mag_sensor_to_body(mag, mag_body);
+    mag_sensor_to_body(mag_prev, mag_prev_body);
     for (int i = 0; i < 3; i++) {
-        dipole[i] = -BDOT_GAIN * (mag[i] - mag_prev[i]) / 0.5f;
+        dipole[i] = -BDOT_GAIN * (mag_body[i] - mag_prev_body[i]) / 0.5f;
     }
     moment2current3axis(dipole, Imax, expected);
     check_true(!body_is_pointing(), "tumbling in eclipse -> stays in detumble mode");
     check_vec_close("detumble output is the B-dot dipole (-k dB/dt) through the current model", currents, expected, 3, 1e-10f);
+    check_true(exactly(currents[2], expected[2]) && expected[2] > 0.0f,
+               "detumble Z current uses body Z = -U10 (sign flipped from the raw reading)");
 
     // Garbage in never crashes and never produces garbage out
     float nan_mag[3] = {NAN, 0, 0};
