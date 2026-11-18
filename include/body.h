@@ -41,18 +41,19 @@ extern const float R_IN_SHADOW[3 * 3];
  * One ADCS step.
  *
  * Units / conventions:
- *   magnetometer: body frame, TESLA (same units as the WMM model and torque_2_moments)
- *   gyro:         body frame, rad/s
+ *   magnetometer: SENSOR axes [U8, U9, U10], TESLA (same units as the WMM model)
+ *   gyro:         SENSOR (gyro chip) axes, rad/s
+ *                 Both are mapped to the body frame internally; see sensor_frames.h.
  *   photodiodes:  NUM_DIODES raw readings in PHOTODIODES order
  *   posn_update:  TLE mean [n (rev/day), e, i, RAAN, argp, M (rad)] or NULLPTR to reuse the last TLE
  *                 Call body_set_tle_metadata() first; a new TLE without metadata is rejected.
  *   unix_time / jd_scalar + jd_frac: the same instant, UTC
- *   output_currents: magnetorquer currents (A); always written when non-NULL
+ *   output_currents: magnetorquer currents (A), body X/Y/Z = C2/C1/Air; always written when non-NULL
  *                    Zero-moment commands also pass through the current converter.
  */
-void body(const float* last_magnetometer_measurements, // 1x3
-          const float* magnetometer_measurements,      // 1x3
-          const float* gyro_measurements,              // 1x3, radians
+void body(const float* last_magnetometer_measurements, // 1x3, [U8, U9, U10]
+          const float* magnetometer_measurements,      // 1x3, [U8, U9, U10]
+          const float* gyro_measurements,              // 1x3, gyro axes, rad/s
           const float* photodiode_measurements,        // 1xNUM_DIODES, raw readings
           const float* posn_update,                    // 1x6, may be NULLPTR
           int unix_time,                               // unix time

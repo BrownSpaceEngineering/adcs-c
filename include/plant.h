@@ -23,7 +23,8 @@
  * plant_call_body() does the middle two lines for a host run. In PIL, send `in` to the target
  * and the 3 currents back.
  *
- * Frames / units match body.h: magnetometer body frame in TESLA, gyro rad/s, photodiodes raw,
+ * Frames / units match body.h: magnetometer in sensor axes [U8, U9, U10] in TESLA, gyro in gyro
+ * chip axes in rad/s (both mapped from body truth via sensor_frames.h), photodiodes raw,
  * posn_update = TLE mean [n (rev/day), e, i, RAAN, argp, M] with angles in radians.
  * Quaternions are Hamilton scalar-first, ACTIVE body->ECI (same as the filter estimate).
  */
@@ -56,9 +57,9 @@ typedef struct {
 
 /* Exactly the arguments body() takes for one tick (plus the TLE metadata call). */
 typedef struct {
-    float last_magnetometer[3];     /* T, body (previous tick's sample; NaN during dropouts) */
-    float magnetometer[3];          /* T, body */
-    float gyro[3];                  /* rad/s, body */
+    float last_magnetometer[3];     /* T, [U8,U9,U10] (previous tick's sample; NaN during dropouts) */
+    float magnetometer[3];          /* T, [U8,U9,U10] */
+    float gyro[3];                  /* rad/s, gyro chip axes */
     float photodiodes[NUM_DIODES];  /* raw, PHOTODIODES order */
     bool has_posn_update;           /* true on an uplink tick: pass posn_update, else NULLPTR */
     float posn_update[6];

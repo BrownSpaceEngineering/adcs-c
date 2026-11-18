@@ -12,6 +12,7 @@
 #include "include/photodiode_determination.h"
 #include "include/quat.h"
 #include "include/quest.h"
+#include "include/sensor_frames.h"
 #include "include/sgp4_step.h"
 #include "include/sunvec.h"
 #include "include/torque2moments.h"
@@ -19,8 +20,8 @@
 #include "string.h"
 #include <limits.h>
 
-//U9: +y, U8: +x, U10: -z
-//NEED TO CHECK WITH FLIGHT SOFTWARE
+// Magnetometer [U8, U9, U10] and gyro readings arrive in sensor axes; body() maps them to the body
+// frame (sensor_frames.h) before anything else sees them.
 
 // Providence, lla2ecef(41.825226, -71.418884, 0) (see eceftoeci.m)
 float PVD_ECEF[3] = {6.3761e6f, -0.1387e6f, 0.0807e6f};
@@ -316,16 +317,17 @@ static bool valid_tle_mean(const float* elements) {
     return true;
 }
 
-void body(const float* last_magnetometer_measurements, // 1x3
-          const float* magnetometer_measurements,      // 1x3
-          const float* gyro_measurements,              // 1x3, radians
-          const float* photodiode_measurements,        // 1xNUM_DIODES, raw readings
-          const float* posn_update,                    // TLE mean elements, or NULLPTR
-          int unix_time,                               // unix time
-          int jd_scalar,                               // scalar JD
-          float jd_frac,                               // fractional JD
-          float dt,                                    // time since last update
-          float* output_currents) {
+// The ADCS step proper. Magnetometer and gyro are already in the BODY frame here.
+static void body_core(const float* last_magnetometer_measurements, // 1x3, body
+                      const float* magnetometer_measurements,      // 1x3, body
+                      const float* gyro_measurements,              // 1x3, body, rad/s
+                      const float* photodiode_measurements,        // 1xNUM_DIODES, raw readings
+                      const float* posn_update,                    // TLE mean elements, or NULLPTR
+                      int unix_time,                               // unix time
+                      int jd_scalar,                               // scalar JD
+                      float jd_frac,                               // fractional JD
+                      float dt,                                    // time since last update
+                      float* output_currents) {
     // memzero output currents to start. ensures that any "bail" automatically sets output currents to 0
     if (output_currents != NULLPTR) zero_currents(output_currents);
     else return;
@@ -579,4 +581,37 @@ void body(const float* last_magnetometer_measurements, // 1x3
 
     // Moment -> coil currents
     moment2current3axis(m_out, Imax, output_currents);
+}
+
+// Public entry point: takes raw sensor-axis readings, maps them to the body frame, runs the step.
+// NULL inputs stay NULL so body_core's bail-outs behave exactly as before. The magnetorquers are
+// wired as body X/Y/Z, so the output currents need no mapping.
+void body(const float* last_magnetometer_measurements, // 1x3, [U8, U9, U10]
+          const float* magnetometer_measurements,      // 1x3, [U8, U9, U10]
+          const float* gyro_measurements,              // 1x3, gyro axes, rad/s
+          const float* photodiode_measurements,        // 1xNUM_DIODES, raw readings
+          const float* posn_update,                    // TLE mean elements, or NULLPTR
+          int unix_time,                               // unix time
+          int jd_scalar,                               // scalar JD
+          float jd_frac,                               // fractional JD
+          float dt,                                    // time since last update
+          float* output_currents) {
+    float last_mag_body[3], mag_body[3], gyro_body[3];
+    const float* last_mag_in = NULLPTR;
+    const float* mag_in = NULLPTR;
+    const float* gyro_in = NULLPTR;
+    if (last_magnetometer_measurements != NULLPTR) {
+        mag_sensor_to_body(last_magnetometer_measurements, last_mag_body);
+        last_mag_in = last_mag_body;
+    }
+    if (magnetometer_measurements != NULLPTR) {
+        mag_sensor_to_body(magnetometer_measurements, mag_body);
+        mag_in = mag_body;
+    }
+    if (gyro_measurements != NULLPTR) {
+        gyro_sensor_to_body(gyro_measurements, gyro_body);
+        gyro_in = gyro_body;
+    }
+    body_core(last_mag_in, mag_in, gyro_in, photodiode_measurements, posn_update, unix_time, jd_scalar,
+              jd_frac, dt, output_currents);
 }

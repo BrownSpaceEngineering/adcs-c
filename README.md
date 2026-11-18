@@ -17,6 +17,31 @@ Every check prints `[PASS]` or `[FAIL]` (numeric checks also print the measured 
 limit), and a summary at the end. A failing check never stops the run; the exit status is 1 if
 anything failed. Tests live in `src/test.c`.
 
+### Known failing tests
+12 checks currently fail (357/369 pass). All 12 already failed before the sensor-frame change, on
+`c516e7f`, with identical values, so they are not caused by it. Not yet fixed:
+
+- `photodiode sun vector: NaN reading -> rejected`: a NaN photodiode reading is not rejected.
+  This may be a real bug in `photodiode_determination.c` and needs a look.
+- 11 checks in `ADCS step (body.c)`. These look like stale tests rather than an algorithm problem:
+  `body()` now waits `BODY_READY_TO_POINT_TICKS` (50) consecutive ready ticks before handing off
+  from detumble to pointing, but the tests expect the hand-off after a single step.
+  - Hand-off after one step: `low rates + sun visible -> switches to pointing`,
+    `attitude is initialized`, `QUEST initial attitude error` (91 deg, measured against an attitude
+    QUEST never set), `transition step commands zero moment`.
+  - Tick bookkeeping that assumes pointing started at tick 0: `ticks n through K command zero
+    magnetic moment`, `predict-only ticks leave gyro bias unchanged`, `only measurement ticks make
+    a meaningful gyro-bias correction`.
+  - Recovery expected within a few steps: `valid magnetometer after a persistent fault resumes
+    pointing`, and the three `gyro glitch:` checks (no filter is running to reset, and 5 steps is
+    fewer than the 50-tick wait).
+
+  The pointing-accuracy checks still pass: sunlit error 0.37 deg, eclipse max 1.0 deg, gyro bias
+  within 0.002 deg/s. The plant sim also behaves normally.
+
+On Linux (glibc), strict C99 hides `M_PI` / `M_SQRT1_2`, so `test.c` and `plant_sim.c` don't
+compile as-is. For now, configure with `cmake -S . -B build -DCMAKE_C_FLAGS=-D_DEFAULT_SOURCE`.
+
 Some expected values come from `tools/reference_values.py`, a pure-Python (no numpy)
 double-precision reference that re-derives them independently (e.g. the WMM field as
 `-grad(V)` of the spherical-harmonic potential). Re-run it if you change a model:
@@ -27,9 +52,20 @@ python3 tools/reference_values.py
 ## Conventions
 - Quaternions are Hamilton, scalar-first `[w, x, y, z]`, active (`quat_apply(q, v) = q v q^-1`).
   The filter estimates body->ECI.
-- `body()` expects the magnetometer in body frame, **Tesla** (same units as the WMM model),
-  the gyro in rad/s, and orbital elements as `[a (m), e, i, RAAN, argp, nu]` with angles in
-  **degrees**. `orbital_to_eci*` take angles in radians.
+- `body()` takes **raw sensor-axis** readings and maps them to the body frame itself
+  (`include/sensor_frames.h`): the magnetometer as `[U8, U9, U10]` in **Tesla** (same units as the
+  WMM model), the gyro in its own chip axes in rad/s. Output currents are body X/Y/Z.
+  Orbital elements are `[a (m), e, i, RAAN, argp, nu]` with angles in **degrees**.
+  `orbital_to_eci*` take angles in radians.
+
+  | Body axis | Magnetometer | Gyro | Magnetorquer |
+  |---|---|---|---|
+  | X | U8 | −Y | C2 |
+  | Y | U9 | −X | C1 |
+  | Z | −U10 | −Z | Air |
+
+  The S-band antenna is on +Z (the pointing axis in `newpointing.c`); photodiode normals are
+  already in body axes.
 - `iterate()` (the UKF) takes 0 (predict only), 1 (magnetometer only, eclipse) or 2 (magnetometer
   and sun) measurement vectors, which should be unit vectors.
 

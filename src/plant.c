@@ -3,6 +3,7 @@
 #include "include/body.h"
 #include "include/magnetosphere.h"
 #include "include/photodiode_determination.h"
+#include "include/sensor_frames.h"
 #include "include/sgp4_init.h"
 #include "include/sgp4_propagate.h"
 #include "include/sunvec.h"
@@ -387,10 +388,14 @@ void plant_sense(plant_t* p, plant_body_inputs_t* in) {
         gyro_bad = outage(p, &p->out_gyro, GYRO_NAN);
         for (int k = 0; k < NUM_DIODES; k++) pd_bad[k] = outage(p, &p->out_pd[k], PD_NAN);
     }
+    /* body() takes raw sensor axes, so report what the hardware would: [U8, U9, U10] and gyro chip axes */
+    float mag_body_f[3], gyro_body_f[3];
     for (int i = 0; i < 3; i++) {
-        in->magnetometer[i] = mag_bad ? NAN : (float)mag[i];
-        in->gyro[i] = gyro_bad ? NAN : (float)gyro[i];
+        mag_body_f[i] = mag_bad ? NAN : (float)mag[i];
+        gyro_body_f[i] = gyro_bad ? NAN : (float)gyro[i];
     }
+    mag_body_to_sensor(mag_body_f, in->magnetometer);
+    gyro_body_to_sensor(gyro_body_f, in->gyro);
     for (int k = 0; k < NUM_DIODES; k++) in->photodiodes[k] = pd_bad[k] ? NAN : (float)pd[k];
 
     /* last_mag = previous tick's sample (carries a dropped NaN forward, like the flight buffer) */
