@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
         float currents[3];
         body_sensor_rejects_t b, aft; body_get_sensor_rejects(&b);
         body(in.last_magnetometer, in.magnetometer, in.gyro, in.photodiodes, (have_time && tle_pending) ? pend_mean : NULL,
-             have_time ? in.unix_time : 0, have_time ? in.jd_scalar : 0, have_time ? in.jd_frac : NAN, in.dt, currents);
+             in.unix_time, in.jd_scalar, in.jd_frac, have_time, in.dt, currents);
         body_get_sensor_rejects(&aft);
         if (!OLD) resolve(&b, &aft);
         else if (tle_pending) {

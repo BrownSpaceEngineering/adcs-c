@@ -85,8 +85,18 @@ void body_get_coil_config(float* sign, bool* enabled);
 #define BODY_ORBIT_BAD_TIME 3u       /* non-finite current JD or time since epoch (defensive) */
 #define BODY_ORBIT_DEGENERATE 4u     /* SGP4 returned a non-finite / zero position or velocity */
 #define BODY_ORBIT_NO_TLE 5u         /* orbit: no TLE has ever been adopted (normal before 1st uplink) */
+#define BODY_ORBIT_TIME_INVALID 6u   /* orbit: the caller passed time_valid = false (no orbit, B-dot only) */
+#define BODY_ORBIT_TIME_EPOCH_MISMATCH 7u /* the time is implausibly far from the TLE epoch: the clock (or the
+                                           * uplinked epoch) is wrong. See BODY_CLOCK_MAX_*_EPOCH_DAYS */
 #define BODY_ORBIT_SGP4_BASE 10u     /* 10 + SGP4 error: 11 e out of range, 12 n <= 0, 14 p < 0,
                                       * 16 decayed (r < 1 Earth radius), 17 period >= 225 min */
+
+/* Clock plausibility: the time passed to body() must be within this window around the TLE epoch, or the
+ * orbit (and with it the WMM field and sun vector) is treated as unusable. A clock that reset to a default
+ * date, or a wrong uplinked time, lands far outside it. The TLE side is generous so that a TLE left un-refreshed
+ * for weeks keeps pointing (SGP4 error grows ~ km/day, which costs well under a degree at that age). */
+#define BODY_CLOCK_MAX_BEFORE_EPOCH_DAYS 2.0
+#define BODY_CLOCK_MAX_AFTER_EPOCH_DAYS 120.0
 
 /* Sensor-check telemetry. Fields are running totals of samples rejected since body_reset() (they
  * only go up; the ground differences consecutive packets), except the *_streak fields, which count
@@ -143,6 +153,11 @@ void body_get_sensor_rejects(body_sensor_rejects_t* out);
  *   posn_update:  TLE mean [n (rev/day), e, i, RAAN, argp, M (rad)] or NULLPTR to reuse the last TLE
  *                 Call body_set_tle_metadata() first; a new TLE without metadata is rejected.
  *   unix_time / jd_scalar + jd_frac: the same instant, UTC
+ *   time_valid:   false if the caller's clock isn't trusted (never set since boot, restored after an outage of
+ *                 unknown length, ...). body() then computes no orbit: it keeps detumbling with B-dot (which needs
+ *                 only the magnetometer), doesn't hand off to pointing, falls back to B-dot after
+ *                 ORBIT_MAX_FAIL_TICK ticks if it was pointing, and leaves a pending TLE untouched (not
+ *                 counted as rejected) until the time is valid. orbit_fail_reason = BODY_ORBIT_TIME_INVALID.
  *   output_currents: magnetorquer currents (A), body X/Y/Z = C2/C1/Air; always written when non-NULL
  *                    Zero-moment commands also pass through the current converter.
  */
@@ -154,12 +169,18 @@ void body(const float* last_magnetometer_measurements, // 1x3, [U8, U9, U10]
           int unix_time,                               // unix time
           int jd_scalar,
           float jd_frac,
+          bool time_valid,                             // false: clock not trusted, no orbit (B-dot only)
           float dt,                                    // time since last update
           float* output_currents);                     // 1x3
 
 // Clears all filter / mode state (power-on state)
 void body_reset(void);
 bool body_is_pointing(void);
+/* Detumble-only mode (ground command): body() keeps running B-dot and never hands off to pointing; if it was
+ * pointing, it drops back to B-dot on the next step. All of the usual checks and telemetry keep running.
+ * body_reset() turns it off; the caller re-applies its mode after a reset. */
+void body_set_detumble_only(bool on);
+bool body_is_detumble_only(void);
 // Current body->ECI estimate; returns false if the attitude hasn't been initialized
 bool body_get_attitude(float* q_body_to_eci);
 void body_get_gyro_bias(float* bias);

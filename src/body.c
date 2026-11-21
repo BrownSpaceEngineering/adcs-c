@@ -110,6 +110,7 @@ static float error_quat_cov[6 * 6];
 static float q_want_prev[4] = {1, 0, 0, 0};
 
 static bool pointing = false;
+static bool detumble_only = false; // ground command: B-dot only, never hand off (body_set_detumble_only)
 static bool tle_initialized = false;
 static bool attitude_initialized = false;
 static int filter_resets = 0;
@@ -171,6 +172,7 @@ void body_reset(void) {
     q_want_prev[2] = 0.0f;
     q_want_prev[3] = 0.0f;
     pointing = false;
+    detumble_only = false;
     tle_initialized = false;
     position_valid = false;
     memset(last_r_eci, 0, sizeof(last_r_eci));
@@ -236,6 +238,13 @@ bool body_get_position(float* r_eci_m) {
 }
 
 bool body_is_pointing(void) { return pointing; }
+
+void body_set_detumble_only(bool on) {
+    detumble_only = on;
+    ready_ticks = 0; // leaving detumble-only needs a fresh run of calm ticks before handing off
+}
+
+bool body_is_detumble_only(void) { return detumble_only; }
 
 bool body_get_attitude(float* q_body_to_eci) {
     memcpy(q_body_to_eci, estimated_quat, sizeof(estimated_quat));
@@ -606,7 +615,14 @@ static void reject_new_tle(unsigned int reason) {
     tle_metadata_pending = false;
 }
 
-static bool update_orbit(const float* posn_update, int jd_scalar, float jd_frac, float* r_eci, float* v_eci) {
+static bool update_orbit(const float* posn_update, int jd_scalar, float jd_frac, bool time_valid, float* r_eci,
+                         float* v_eci) {
+    // An untrusted clock means no orbit. A pending TLE is left alone (not adopted, not rejected, metadata kept)
+    // so the caller can hand it over again once the time is valid.
+    if (!time_valid) {
+        orbit_err = BODY_ORBIT_TIME_INVALID;
+        return false;
+    }
     double current_jd = (double)jd_scalar + (double)jd_frac;
     if (!isfinite(current_jd)) {
         orbit_err = BODY_ORBIT_BAD_TIME;
@@ -640,6 +656,14 @@ static bool update_orbit(const float* posn_update, int jd_scalar, float jd_frac,
     if (!isfinite(seconds_since_epoch)) {
         if (adopt) reject_new_tle(BODY_ORBIT_BAD_TIME);
         orbit_err = BODY_ORBIT_BAD_TIME;
+        return false;
+    }
+    // Clock plausibility: a time far from the TLE epoch means the clock (or the epoch) is wrong. SGP4 would still
+    // return a finite but wrong position, so catch it here instead.
+    double days_since_epoch = seconds_since_epoch / 86400.0;
+    if (days_since_epoch < -BODY_CLOCK_MAX_BEFORE_EPOCH_DAYS || days_since_epoch > BODY_CLOCK_MAX_AFTER_EPOCH_DAYS) {
+        if (adopt) reject_new_tle(BODY_ORBIT_TIME_EPOCH_MISMATCH);
+        orbit_err = BODY_ORBIT_TIME_EPOCH_MISMATCH;
         return false;
     }
     float r_km[3], v_km_s[3], oe_osc[7];
@@ -686,6 +710,7 @@ static void body_core(const float* last_magnetometer_measurements, // 1x3, body
                       int unix_time,                               // unix time
                       int jd_scalar,                               // scalar JD
                       float jd_frac,                               // fractional JD
+                      bool time_valid,                             // false: clock not trusted (B-dot only)
                       float dt,                                    // time since last update
                       float* output_currents) {
     // memzero output currents to start. ensures that any "bail" automatically sets output currents to 0
@@ -743,7 +768,7 @@ static void body_core(const float* last_magnetometer_measurements, // 1x3, body
     // Orbit and field model. B-dot doesn't need them, so detumbling runs before the first TLE;
     // pointing (and the hand-off to it) does.
     float r_eci[3], v_eci[3], expected_mag[3] = {0.0f, 0.0f, 0.0f}, mag_ref_unit[3] = {0.0f, 0.0f, 0.0f};
-    bool have_orbit = update_orbit(posn_update, jd_scalar, jd_frac, r_eci, v_eci);
+    bool have_orbit = update_orbit(posn_update, jd_scalar, jd_frac, time_valid, r_eci, v_eci);
     if (have_orbit) {
         rejects.orbit_fail_streak = 0;
         rejects.orbit_fail_reason = BODY_ORBIT_OK;
@@ -788,6 +813,12 @@ static void body_core(const float* last_magnetometer_measurements, // 1x3, body
         mag_fault_ticks++;
     }
     if (pointing && mag_fault_ticks >= BODY_MAG_FAULT_RESET_TICKS) {
+        reset_filter_to_detumble();
+        return;
+    }
+
+    // Detumble-only mode (ground command): drop out of pointing and stay in B-dot
+    if (pointing && detumble_only) {
         reset_filter_to_detumble();
         return;
     }
@@ -843,7 +874,8 @@ static void body_core(const float* last_magnetometer_measurements, // 1x3, body
 
         // Case 1: Measurements tell us to stop detumbling. Hand off only on a sample tick, so QUEST
         // gets a clean magnetometer vector.
-        if (have_orbit && ready_to_point(photodiodes, gyro_measurements, gyro_valid) && sample_tick && mag_valid) {
+        if (!detumble_only && have_orbit && ready_to_point(photodiodes, gyro_measurements, gyro_valid) && sample_tick
+            && mag_valid) {
             // We only get here right after deployment or after a filter reset, so start the
             // bias estimate from zero
 
@@ -1027,6 +1059,7 @@ void body(const float* last_magnetometer_measurements, // 1x3, [U8, U9, U10]
           int unix_time,                               // unix time
           int jd_scalar,                               // scalar JD
           float jd_frac,                               // fractional JD
+          bool time_valid,                             // false: clock not trusted (B-dot only)
           float dt,                                    // time since last update
           float* output_currents) {
     float last_mag_body[3], mag_body[3], gyro_body[3];
@@ -1046,5 +1079,5 @@ void body(const float* last_magnetometer_measurements, // 1x3, [U8, U9, U10]
         gyro_in = gyro_body;
     }
     body_core(last_mag_in, mag_in, gyro_in, photodiode_measurements, posn_update, unix_time, jd_scalar,
-              jd_frac, dt, output_currents);
+              jd_frac, time_valid, dt, output_currents);
 }

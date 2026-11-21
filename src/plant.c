@@ -294,6 +294,8 @@ void plant_default_config(plant_config_t* cfg) {
     cfg->faults.coil_fault_t = INFINITY;
     cfg->faults.gyro_dead_t0 = cfg->faults.gyro_dead_t1 = INFINITY;
     cfg->faults.clock_jump_t0 = cfg->faults.clock_jump_t1 = INFINITY;
+    cfg->faults.time_invalid_t0 = cfg->faults.time_invalid_t1 = INFINITY;
+    cfg->faults.detumble_only_t0 = cfg->faults.detumble_only_t1 = INFINITY;
     for (int i = 0; i < 3; i++) cfg->faults.coil_gain[i] = 1.0;
     cfg->seed = 1;
     cfg->nan_dropouts = true;
@@ -346,6 +348,8 @@ void plant_sense(plant_t* p, plant_body_inputs_t* in) {
     in->jd_frac = (float)(jd - jd_int);
     in->unix_time = unix_time_of(jd);
     in->dt = (float)PLANT_DT;
+    in->time_valid = !(p->t >= p->cfg.faults.time_invalid_t0 && p->t < p->cfg.faults.time_invalid_t1);
+    in->detumble_only = p->t >= p->cfg.faults.detumble_only_t0 && p->t < p->cfg.faults.detumble_only_t1;
     /* clock_jump_days = nan: the flight clock reads garbage (NaN fraction of day) in the window */
     if (p->t >= p->cfg.faults.clock_jump_t0 && p->t < p->cfg.faults.clock_jump_t1 && isnan(p->cfg.faults.clock_jump_days)) {
         in->jd_scalar = (int)floor(jd_now(p));
@@ -515,10 +519,23 @@ void plant_get_truth(const plant_t* p, plant_truth_t* truth) {
 }
 
 void plant_call_body(const plant_body_inputs_t* in, float* currents) {
-    if (in->has_posn_update) body_set_tle_metadata(in->bstar, in->tle_epoch_jd);
-    body(in->last_magnetometer, in->magnetometer, in->gyro, in->photodiodes,
-         in->has_posn_update ? in->posn_update : NULLPTR, in->unix_time, in->jd_scalar, in->jd_frac,
-         in->dt, currents);
+    /* Like the flight software (PVDXos adcs_task.c): an uplinked TLE stays pending, and is handed to body()
+     * every step, until body() has accepted or rejected it (its counters change). While time_valid is false
+     * body() leaves it untouched, so it is adopted once the clock is trusted again. */
+    static float pending[6];
+    static bool pending_valid = false;
+    if (in->has_posn_update) {
+        body_set_tle_metadata(in->bstar, in->tle_epoch_jd);
+        memcpy(pending, in->posn_update, sizeof(pending));
+        pending_valid = true;
+    }
+    if (in->detumble_only != body_is_detumble_only()) body_set_detumble_only(in->detumble_only);
+    body_sensor_rejects_t before, after;
+    body_get_sensor_rejects(&before);
+    body(in->last_magnetometer, in->magnetometer, in->gyro, in->photodiodes, pending_valid ? pending : NULLPTR,
+         in->unix_time, in->jd_scalar, in->jd_frac, in->time_valid, in->dt, currents);
+    body_get_sensor_rejects(&after);
+    if (after.tle_accepted != before.tle_accepted || after.tle_rejected != before.tle_rejected) pending_valid = false;
 }
 
 int plant_fsw_step_host(const plant_body_inputs_t* in, float* currents, void* ctx) {

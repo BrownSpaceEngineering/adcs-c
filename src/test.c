@@ -2114,7 +2114,7 @@ static void body_sim_step(body_sim_t* s, bool sunlit, int dt_s, float* currents)
         s->tle_sent = true;
     }
     body(s->last_mag, mag, gyro, diodes, update, s->unix_time, s->jd_int,
-         (float)s->jd_frac, (float)dt_s, currents);
+         (float)s->jd_frac, true, (float)dt_s, currents);
     memcpy(s->last_mag, mag, sizeof(mag));
 }
 
@@ -2129,7 +2129,7 @@ static void body_sim_bad_mag_step(body_sim_t* s, const float* bad_current, const
     const float* current = replace_current ? bad_current : mag;
     const float* previous = replace_previous ? bad_previous : s->last_mag;
     body(previous, current, gyro, diodes, NULLPTR, s->unix_time, s->jd_int, (float)s->jd_frac,
-         1.0f, currents);
+         true, 1.0f, currents);
     memcpy(s->last_mag, mag, sizeof(mag));
 }
 
@@ -2197,7 +2197,7 @@ void test_body(void) {
 
     body_reset();
     currents[0] = currents[1] = currents[2] = 123.0f;
-    body(mag_prev, mag, gyro, diodes_dark, NULLPTR, 1767225600, 2461041, 0.5f, 1.0f, currents);
+    body(mag_prev, mag, gyro, diodes_dark, NULLPTR, 1767225600, 2461041, 0.5f, true, 1.0f, currents);
     check_vec_close("no position yet -> zero currents (and currents are always written)", currents, zero, 3, 0);
     check_true(!body_is_pointing(), "no position yet -> not pointing");
     {
@@ -2211,7 +2211,7 @@ void test_body(void) {
         body_reset();
         body_set_tle_metadata(getter_sim.tle_bstar, getter_sim.tle_epoch_jd);
         body(mag_prev, mag, gyro, diodes_dark, getter_sim.tle_mean, getter_sim.unix_time, getter_sim.jd_int,
-             (float)getter_sim.jd_frac, 0.5f, currents);
+             (float)getter_sim.jd_frac, true, 0.5f, currents);
         check_true(body_get_tle(tle_out, &bstar_out, &epoch_out), "committed TLE -> body_get_tle returns true");
         check_true(memcmp(tle_out, getter_sim.tle_mean, sizeof(tle_out)) == 0, "body_get_tle returns the committed elements");
         check_true(memcmp(&epoch_out, &getter_sim.tle_epoch_jd, sizeof(epoch_out)) == 0, "body_get_tle returns the committed epoch");
@@ -2225,7 +2225,7 @@ void test_body(void) {
     body_sim_t s;
     body_sim_init(&s);
     body_reset();
-    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
     check_vec_close("TLE without metadata (epoch, B*) is rejected -> zero currents", currents, zero, 3, 0);
     {
         body_sensor_rejects_t rj;
@@ -2235,8 +2235,8 @@ void test_body(void) {
         check_true(rj.orbit_fail_reason == BODY_ORBIT_NO_TLE && rj.orbit_fail_streak == 1u,
                    "telemetry: no orbit before the first TLE (reason NO_TLE, streak counting)");
         body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
-        body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
-        body(mag_prev, mag, gyro, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+        body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
+        body(mag_prev, mag, gyro, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
         body_get_sensor_rejects(&rj);
         check_true(rj.tle_rejected == 1u && rj.tle_accepted == 1u,
                    "telemetry: valid TLE counted as accepted, NULLPTR ticks not counted");
@@ -2247,7 +2247,7 @@ void test_body(void) {
         memcpy(bad_tle, s.tle_mean, sizeof(bad_tle));
         bad_tle[0] = 1.0f;
         body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
-        body(mag_prev, mag, gyro, diodes_dark, bad_tle, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+        body(mag_prev, mag, gyro, diodes_dark, bad_tle, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
         body_get_sensor_rejects(&rj);
         printf("    (bad-n TLE: tle_last_reject = %u)\n", rj.tle_last_reject);
         check_true(rj.tle_rejected == 2u && rj.tle_last_reject > BODY_ORBIT_SGP4_BASE,
@@ -2256,10 +2256,37 @@ void test_body(void) {
         double epoch_now;
         body_get_tle(tle_now, &bstar_now, &epoch_now);
         check_true(memcmp(tle_now, s.tle_mean, sizeof(tle_now)) == 0, "rejected TLE leaves the saved TLE in use");
-        body(mag_prev, mag, gyro, diodes_dark, bad_tle, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+        body(mag_prev, mag, gyro, diodes_dark, bad_tle, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
         body_get_sensor_rejects(&rj);
         check_true(rj.tle_last_reject == BODY_ORBIT_NO_METADATA,
                    "resending only the elements is rejected: the failed upload used up its metadata");
+    }
+    {
+        body_reset(); // fresh counters
+        // time_valid = false: no orbit, the pending TLE is neither adopted nor rejected (metadata kept)
+        body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
+        body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, false, 0.5f,
+             currents);
+        body_sensor_rejects_t rt;
+        body_get_sensor_rejects(&rt);
+        float r_tmp[3];
+        check_true(rt.tle_accepted == 0u && rt.tle_rejected == 0u && rt.orbit_fail_reason == BODY_ORBIT_TIME_INVALID &&
+                       !body_get_position(r_tmp),
+                   "time_valid = false: no orbit, TLE left pending (not adopted, not rejected)");
+        // A clock a year before the TLE epoch: the TLE is rejected as a time / epoch mismatch
+        body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time - 365 * 86400, s.jd_int - 365, (float)s.jd_frac,
+             true, 0.5f, currents);
+        body_get_sensor_rejects(&rt);
+        check_true(rt.tle_rejected == 1u && rt.tle_last_reject == BODY_ORBIT_TIME_EPOCH_MISMATCH &&
+                       rt.orbit_fail_reason == BODY_ORBIT_TIME_EPOCH_MISMATCH,
+                   "clock a year before the TLE epoch: rejected as a time / epoch mismatch");
+    }
+    {
+        // Detumble-only mode: set / get, and body_reset() turns it off
+        body_set_detumble_only(true);
+        bool on = body_is_detumble_only();
+        body_reset();
+        check_true(on && !body_is_detumble_only(), "detumble-only: set / get, cleared by body_reset");
     }
     body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
     // B-dot cycle: two cycles with a field ramping each tick. Only the clean sample on the last tick
@@ -2279,7 +2306,7 @@ void test_body(void) {
         if (k == BODY_BDOT_PERIOD_TICKS) memcpy(mag_sample1, mag_k, sizeof(mag_k));
         if (k == 2u * BODY_BDOT_PERIOD_TICKS) memcpy(mag_sample2, mag_k, sizeof(mag_k));
         body(mag_prev, mag_k, gyro_k, diodes_dark, k == 1 ? s.tle_mean : NULLPTR, s.unix_time, s.jd_int,
-             (float)s.jd_frac, 0.5f, currents);
+             (float)s.jd_frac, true, 0.5f, currents);
         unsigned int c = (k - 1u) % BODY_BDOT_PERIOD_TICKS + 1u;
         bool quiet = c != BODY_BDOT_PERIOD_TICKS && c >= BODY_BDOT_PERIOD_TICKS - BODY_BDOT_QUIET_TICKS;
         for (int i = 0; i < 3; i++) {
@@ -2310,7 +2337,7 @@ void test_body(void) {
         for (int i = 0; i < 3; i++) gyro_k[i] = gyro[i] + 1e-5f * (float)((k + 1u + (unsigned int)i) % 3u);
         float mag_hold[3];
         for (int i = 0; i < 3; i++) mag_hold[i] = mag_sample2[i] + (float)k * ramp[i];
-        body(mag_prev, mag_hold, gyro_k, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+        body(mag_prev, mag_hold, gyro_k, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
         for (int i = 0; i < 3; i++) hold_ok &= exactly(currents[i], expected[i]);
     }
     check_true(hold_ok, "B-dot: dipole held between samples");
@@ -2325,7 +2352,7 @@ void test_body(void) {
                 m[i] = 0.83f * mag[i] + (float)k * ramp[i];
                 g[i] = gyro[i] + 1e-5f * (float)((k + (unsigned int)i) % 3u);
             }
-            body(mag_prev, m, g, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+            body(mag_prev, m, g, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
             for (int i = 0; i < 3; i++) any |= fabsf(currents[i]) > 0.0f;
         }
         check_true(any, "no TLE yet -> B-dot still detumbles");
@@ -2342,7 +2369,7 @@ void test_body(void) {
         for (unsigned int k = 1; k <= BODY_SENSOR_STUCK_TICKS + 5u; k++) {
             for (int i = 0; i < 3; i++) m[i] = 0.83f * mag[i] + (float)k * ramp[i];
             body(mag_prev, m, gyro, diodes_dark, k == 1 ? s.tle_mean : NULLPTR, s.unix_time, s.jd_int,
-                 (float)s.jd_frac, 0.5f, currents);
+                 (float)s.jd_frac, true, 0.5f, currents);
         }
         body_get_sensor_rejects(&rj);
         check_true(rj.gyro_stuck == 5u, "gyro bit-identical for STUCK_TICKS+ samples -> rejected as stuck");
@@ -2358,7 +2385,7 @@ void test_body(void) {
             if (k == 5u) g[0] += 1.0f;               // single spike
             if (k >= 15u) g[1] += 0.1f;              // persistent step
             body(mag_prev, m, g, diodes_dark, k == 1 ? s.tle_mean : NULLPTR, s.unix_time, s.jd_int,
-                 (float)s.jd_frac, 0.5f, currents);
+                 (float)s.jd_frac, true, 0.5f, currents);
             n++;
         }
         body_get_sensor_rejects(&rj);
@@ -2371,13 +2398,13 @@ void test_body(void) {
             for (int i = 0; i < 3; i++) g[i] = gyro[i] + 1e-5f * (float)((k + (unsigned int)i) % 3u);
             float mm[3] = {0.83f * mag[0], 0.83f * mag[1], 0.83f * mag[2]};
             body(mag_prev, mm, g, diodes_dark, k == 1 ? s.tle_mean : NULLPTR, s.unix_time, s.jd_int,
-                 (float)s.jd_frac, 0.5f, currents);
+                 (float)s.jd_frac, true, 0.5f, currents);
         }
         body_get_sensor_rejects(&rj);
         check_true(rj.mag_stuck == 3u, "magnetometer bit-identical for STUCK_TICKS+ samples -> rejected as stuck");
         {
             float railed[3] = {800e-6f, 0.83f * mag[1], 0.83f * mag[2]};
-            body(mag_prev, railed, gyro, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+            body(mag_prev, railed, gyro, diodes_dark, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
             body_get_sensor_rejects(&rj);
             check_true(rj.mag_norm == 1u, "magnetometer railed at 800 uT -> rejected by the |B| vs WMM check");
         }
@@ -2392,7 +2419,7 @@ void test_body(void) {
             for (int d = 0; d < NUM_DIODES; d++) pd[d] = 0.0f;   // dark diodes repeat 0 exactly: fine
             pd[0] = 3.0f;                                         // railed: rejected every tick
             pd[1] = 0.8f;                                         // frozen while lit
-            body(mag_prev, m, g, pd, k == 1 ? s.tle_mean : NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f,
+            body(mag_prev, m, g, pd, k == 1 ? s.tle_mean : NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f,
                  currents);
         }
         body_get_sensor_rejects(&rj);
@@ -2403,14 +2430,14 @@ void test_body(void) {
 
     // Garbage in never crashes and never produces garbage out
     float nan_mag[3] = {NAN, 0, 0};
-    body(mag_prev, nan_mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+    body(mag_prev, nan_mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
     check_vec_close("NaN magnetometer -> zero currents", currents, zero, 3, 0);
     check_true(body_get_filter_resets() == 0, "bad magnetometer while detumbling -> no filter reset");
-    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.0f, currents);
+    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.0f, currents);
     check_vec_close("dt = 0 -> zero currents", currents, zero, 3, 0);
-    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, NAN, currents);
+    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, NAN, currents);
     check_vec_close("dt = NaN -> zero currents", currents, zero, 3, 0);
-    body(NULLPTR, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 0.5f, currents);
+    body(NULLPTR, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, 0.5f, currents);
     check_vec_close("NULL previous magnetometer -> zero currents", currents, zero, 3, 0);
 
     // Slow rotation in sunlight -> QUEST initialization and pointing
@@ -2540,7 +2567,7 @@ void test_body(void) {
         body_sim_advance(&s, 1);
         body_sim_sensors(&s, true, m1, g1, d1);
         g1[0] += 3.0f; // 3 rad for one second
-        body(s.last_mag, m1, g1, d1, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, 1.0f, currents);
+        body(s.last_mag, m1, g1, d1, NULLPTR, s.unix_time, s.jd_int, (float)s.jd_frac, true, 1.0f, currents);
         memcpy(s.last_mag, m1, sizeof(m1));
     }
     int steps_to_reset = -1;
@@ -2562,8 +2589,8 @@ void test_body(void) {
     body_reset();
     body_sim_init(&s);
     body_set_tle_metadata(s.tle_bstar, s.tle_epoch_jd);
-    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, 1.0f, currents);
-    body(mag_prev, mag, gyro, diodes_dark, NULLPTR, s.unix_time + 1, s.jd_int, (float)s.jd_frac, 1.0f, currents);
+    body(mag_prev, mag, gyro, diodes_dark, s.tle_mean, s.unix_time, s.jd_int, (float)s.jd_frac, true, 1.0f, currents);
+    body(mag_prev, mag, gyro, diodes_dark, NULLPTR, s.unix_time + 1, s.jd_int, (float)s.jd_frac, true, 1.0f, currents);
     check_true(all_finite(currents, 3) && !body_is_pointing(), "propagating without a position update works");
 }
 

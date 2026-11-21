@@ -15,7 +15,9 @@
  *             sf_err, m_res, sigma_D, uplink_days, sigma_at   (worst=... first, then overrides)
  *   faults:   spike_t0, spike_t1, mag_spike_p, gyro_spike_p, mag_bias_step_t, mag_bias_step,
  *             coil_fault_t, coil_gain, kick_t, kick_dw (rad/s), gyro_dead_t0, gyro_dead_t1 (NaN gyro),
- *             clock_jump_t0, clock_jump_t1, clock_jump_days (flight clock offset)
+ *             clock_jump_t0, clock_jump_t1, clock_jump_days (flight clock offset),
+ *             time_invalid_t0, time_invalid_t1 (flight software reports time_valid = false),
+ *             detumble_only_t0, detumble_only_t1 (ground commands detumble-only mode)
  * Output: per-orbit table (unless quiet), the reject counters, and one line
  *   SUMMARY key=value ...   (see print_summary) for scripts.
  *
@@ -290,6 +292,10 @@ static int apply_truth_kv(const char* key, const char* val, plant_config_t* cfg)
     else if (!strcmp(key, "clock_jump_t0")) f->clock_jump_t0 = atof(val);
     else if (!strcmp(key, "clock_jump_t1")) f->clock_jump_t1 = atof(val);
     else if (!strcmp(key, "clock_jump_days")) f->clock_jump_days = atof(val);
+    else if (!strcmp(key, "time_invalid_t0")) f->time_invalid_t0 = atof(val);
+    else if (!strcmp(key, "time_invalid_t1")) f->time_invalid_t1 = atof(val);
+    else if (!strcmp(key, "detumble_only_t0")) f->detumble_only_t0 = atof(val);
+    else if (!strcmp(key, "detumble_only_t1")) f->detumble_only_t1 = atof(val);
     else if (!strcmp(key, "coil_gain")) v3 = f->coil_gain;
     else if (!strcmp(key, "kick_t")) { cfg->kick_on = true; cfg->kick_t_s = atof(val); }
     else if (!strcmp(key, "kick_dw")) v3 = cfg->kick_dw;

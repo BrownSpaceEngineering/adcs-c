@@ -54,6 +54,8 @@ typedef struct {
     double gyro_dead_t0, gyro_dead_t1; /* s, gyro outputs NaN in [t0, t1) (dead part / driver) */
     double clock_jump_t0, clock_jump_t1; /* s, flight clock off by clock_jump_days in [t0, t1) */
     double clock_jump_days;
+    double time_invalid_t0, time_invalid_t1; /* s, flight software reports time_valid = false in [t0, t1) */
+    double detumble_only_t0, detumble_only_t1; /* s, ground commands detumble-only mode in [t0, t1) */
 } plant_faults_t;
 
 typedef struct {
@@ -95,6 +97,8 @@ typedef struct {
     float gyro[3];                  /* rad/s, gyro chip axes */
     float photodiodes[NUM_DIODES];  /* raw, PHOTODIODES order */
     bool has_posn_update;           /* true on an uplink tick: pass posn_update, else NULLPTR */
+    bool time_valid;                /* whether flight software trusts its clock (body()'s time_valid) */
+    bool detumble_only;             /* ground-commanded mode (body_set_detumble_only) */
     float posn_update[6];
     float bstar;                    /* call body_set_tle_metadata(bstar, tle_epoch_jd) first */
     double tle_epoch_jd;
