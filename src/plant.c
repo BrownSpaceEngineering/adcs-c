@@ -24,23 +24,22 @@ static const double J_SC[3][3] = {{0.029730, 24.4275e-6, 3672.061e-6},
 /* Coil gains body() assumes (moments2currents.c), A m^2 per A */
 static const double K_COIL[3] = {2.6, 2.6, 1.02};
 #define PD_MAX 1.7 /* MAX_READING in photodiode_determination.c */
+/* Sensor quantization / range (what the flight drivers deliver) */
+#define GYRO_LSB_RAD_S (M_PI / 180.0 / 1600.0) /* SCH16T SENSITIVITY_RATE1 = 1600 LSB/dps (20-bit) */
+#define GYRO_RANGE_RAD_S (524288.0 * GYRO_LSB_RAD_S) /* +-2^19 LSB = +-328 dps */
+#define MAG_LSB_T (1e-6 / 75.0)                /* RM3100 at 200 cycle counts: 75 LSB/uT */
+#define MAG_RANGE_T 800e-6
 
 /* ---------------- error models (Simulink "Sensors (noise)" / "ADCS_Actuators") ---------------- */
-typedef struct {
-    double sigma_mag, mag_bias[3];
-    double gyro_bias0[3], sigma_rrw, sigma_gyro[3];
-    double sigma_pd, pd_spread, albedo;
-    double sf_err[3], m_res[3], sigma_D;
-    double uplink_period_s, sigma_at_s;
-} err_model_t;
+typedef plant_errors_t err_model_t;
 
-static void error_model(int worst_case, err_model_t* e) {
+void plant_error_model(int worst_case, plant_errors_t* e) {
     if (worst_case == 0) {
         *e = (err_model_t){.sigma_mag = 30e-9,
                            .mag_bias = {0, 0, 0},
                            .gyro_bias0 = {0.002, -0.001, 0.0015},
                            .sigma_rrw = 1.4e-7,
-                           .sigma_gyro = {2.5e-5, 2.5e-5, 3.78e-5},
+                           .sigma_gyro = {3.2e-5, 3.2e-5, 4.8e-5}, /* SCH16T Rate_XYZ1, LPF1 13 Hz (~20 Hz ENBW), sampled at 10 Hz */
                            .sigma_pd = 0.01,
                            .pd_spread = 0.0,
                            .albedo = 0.0,
@@ -54,7 +53,7 @@ static void error_model(int worst_case, err_model_t* e) {
                            .mag_bias = {350e-9, -300e-9, 450e-9},
                            .gyro_bias0 = {0.005, -0.0025, 0.00375},
                            .sigma_rrw = 5e-7,
-                           .sigma_gyro = {7.5e-5, 7.5e-5, 1.13e-4},
+                           .sigma_gyro = {9.6e-5, 9.6e-5, 1.44e-4}, /* 3x nominal */
                            .sigma_pd = 0.02,
                            .pd_spread = 0.05,
                            .albedo = 0.4,
@@ -207,8 +206,7 @@ static void orbit_rk4(double* r, double* v, double h) {
 }
 
 /* J^-1 by adjugate: inv[i][j] = cofactor[j][i] / det */
-static void inertia_inverse(double inv[3][3]) {
-    const double(*J)[3] = J_SC;
+static void inertia_inverse(const double J[3][3], double inv[3][3]) {
     double cof[3][3];
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
@@ -223,8 +221,8 @@ static void inertia_inverse(double inv[3][3]) {
 
 /* Attitude derivative. ext = magnetorquer (+ kick) torque, held over the step;
  * gravity gradient is re-evaluated from the attitude at each stage. */
-static void att_deriv(const double* q, const double* w, const double* ext, const double* r_hat_eci,
-                      double n2, bool gg, double* dq, double* dw) {
+static void att_deriv(const plant_t* p, const double* q, const double* w, const double* ext,
+                      const double* r_hat_eci, double n2, bool gg, double* dq, double* dw) {
     dq[0] = -0.5 * (q[1] * w[0] + q[2] * w[1] + q[3] * w[2]);
     dq[1] = 0.5 * (q[0] * w[0] + q[2] * w[2] - q[3] * w[1]);
     dq[2] = 0.5 * (q[0] * w[1] + q[3] * w[0] - q[1] * w[2]);
@@ -233,17 +231,15 @@ static void att_deriv(const double* q, const double* w, const double* ext, const
     if (gg) {
         double rb[3], Jr[3], tg[3];
         eci_to_body(q, r_hat_eci, rb);
-        matvec(J_SC, rb, Jr);
+        matvec(p->cfg.J, rb, Jr);
         crossd(rb, Jr, tg);
         for (int i = 0; i < 3; i++) T[i] += 3.0 * n2 * tg[i];
     }
     double Jw[3], wJw[3], rhs[3];
-    matvec(J_SC, w, Jw);
+    matvec(p->cfg.J, w, Jw);
     crossd(w, Jw, wJw);
     for (int i = 0; i < 3; i++) rhs[i] = T[i] - wJw[i];
-    double Jinv[3][3];
-    inertia_inverse(Jinv);
-    matvec(Jinv, rhs, dw);
+    matvec(p->Jinv, rhs, dw);
 }
 
 /* ---------------- sensors ---------------- */
@@ -291,6 +287,14 @@ static int do_uplink(plant_t* p, const err_model_t* e, plant_body_inputs_t* in) 
 void plant_default_config(plant_config_t* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->q0_body_to_eci[0] = 1.0;
+    memcpy(cfg->J, J_SC, sizeof(cfg->J));
+    plant_error_model(0, &cfg->err);
+    cfg->faults.spike_t0 = cfg->faults.spike_t1 = INFINITY;
+    cfg->faults.mag_bias_step_t = INFINITY;
+    cfg->faults.coil_fault_t = INFINITY;
+    cfg->faults.gyro_dead_t0 = cfg->faults.gyro_dead_t1 = INFINITY;
+    cfg->faults.clock_jump_t0 = cfg->faults.clock_jump_t1 = INFINITY;
+    for (int i = 0; i < 3; i++) cfg->faults.coil_gain[i] = 1.0;
     cfg->seed = 1;
     cfg->nan_dropouts = true;
     cfg->gravity_gradient = true;
@@ -306,8 +310,8 @@ int plant_init(plant_t* p, const plant_config_t* cfg) {
     memset(p, 0, sizeof(*p));
     p->cfg = *cfg;
     rng_seed(p, cfg->seed);
-    err_model_t e;
-    error_model(cfg->worst_case, &e);
+    err_model_t e = cfg->err;
+    inertia_inverse(cfg->J, p->Jinv);
 
     /* Truth orbit at t = 0 from the TLE (flight SGP4, then integrated in double from here on) */
     sgp4_sat_t sat;
@@ -331,17 +335,23 @@ int plant_init(plant_t* p, const plant_config_t* cfg) {
 }
 
 void plant_sense(plant_t* p, plant_body_inputs_t* in) {
-    err_model_t e;
-    error_model(p->cfg.worst_case, &e);
+    const err_model_t e = p->cfg.err;
     memset(in, 0, sizeof(*in));
 
-    /* ---- clock (Orbit + Time block) ---- */
+    /* ---- clock (Orbit + Time block); a clock fault offsets what the flight code is told ---- */
     double jd = jd_now(p);
+    if (p->t >= p->cfg.faults.clock_jump_t0 && p->t < p->cfg.faults.clock_jump_t1) jd += p->cfg.faults.clock_jump_days;
     double jd_int = floor(jd);
     in->jd_scalar = (int)jd_int;
     in->jd_frac = (float)(jd - jd_int);
     in->unix_time = unix_time_of(jd);
     in->dt = (float)PLANT_DT;
+    /* clock_jump_days = nan: the flight clock reads garbage (NaN fraction of day) in the window */
+    if (p->t >= p->cfg.faults.clock_jump_t0 && p->t < p->cfg.faults.clock_jump_t1 && isnan(p->cfg.faults.clock_jump_days)) {
+        in->jd_scalar = (int)floor(jd_now(p));
+        in->jd_frac = NAN;
+        in->unix_time = unix_time_of(jd_now(p));
+    }
 
     /* ---- TLE uplink ---- */
     if (p->n_uplinks == 0 || jd >= p->next_uplink_jd) {
@@ -353,13 +363,33 @@ void plant_sense(plant_t* p, plant_body_inputs_t* in) {
     field_eci(p, p->r, b_eci);
     eci_to_body(p->q, b_eci, b_body);
     double mag[3];
+    const plant_faults_t* F = &p->cfg.faults;
     for (int i = 0; i < 3; i++) mag[i] = b_body[i] + e.mag_bias[i] + e.sigma_mag * randn(p);
+    if (p->t >= F->mag_bias_step_t) {
+        for (int i = 0; i < 3; i++) mag[i] += F->mag_bias_step[i];
+    }
+    bool spike_window = p->t >= F->spike_t0 && p->t < F->spike_t1;
+    if (spike_window && F->mag_spike_p > 0.0 && rand_u(p) < F->mag_spike_p) {
+        /* one axis, log-uniform 10 sigma .. range, random sign (finite: nothing flags it) */
+        int a = (int)(rand_u(p) * 3.0) % 3;
+        double lo = log(10.0 * e.sigma_mag), hi = log(MAG_RANGE_T);
+        mag[a] += (rand_u(p) < 0.5 ? -1.0 : 1.0) * exp(lo + rand_u(p) * (hi - lo));
+    }
+    /* field of our own coils at the magnetometer (currents commanded on the previous tick) */
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) mag[i] += p->cfg.mag_coil_coupling[i][j] * p->coil_I[j];
+    }
 
     /* ---- gyro: bias random walk + white noise ---- */
     double gyro[3];
     for (int i = 0; i < 3; i++) {
         p->gyro_bias[i] += e.sigma_rrw * sqrt(PLANT_DT) * randn(p);
         gyro[i] = p->w[i] + p->gyro_bias[i] + e.sigma_gyro[i] * randn(p);
+    }
+    if (spike_window && F->gyro_spike_p > 0.0 && rand_u(p) < F->gyro_spike_p) {
+        int a = (int)(rand_u(p) * 3.0) % 3;
+        double lo = log(10.0 * e.sigma_gyro[a]), hi = log(GYRO_RANGE_RAD_S);
+        gyro[a] += (rand_u(p) < 0.5 ? -1.0 : 1.0) * exp(lo + rand_u(p) * (hi - lo));
     }
 
     /* ---- photodiodes: cosine law, eclipse, albedo, gain spread, noise ---- */
@@ -388,12 +418,15 @@ void plant_sense(plant_t* p, plant_body_inputs_t* in) {
         gyro_bad = outage(p, &p->out_gyro, GYRO_NAN);
         for (int k = 0; k < NUM_DIODES; k++) pd_bad[k] = outage(p, &p->out_pd[k], PD_NAN);
     }
-    /* body() takes raw sensor axes, so report what the hardware would: [U8, U9, U10] and gyro chip axes */
+    if (p->t >= p->cfg.faults.gyro_dead_t0 && p->t < p->cfg.faults.gyro_dead_t1) gyro_bad = true;
     float mag_body_f[3], gyro_body_f[3];
     for (int i = 0; i < 3; i++) {
-        mag_body_f[i] = mag_bad ? NAN : (float)mag[i];
-        gyro_body_f[i] = gyro_bad ? NAN : (float)gyro[i];
+        double mq = fmin(fmax(round(mag[i] / MAG_LSB_T) * MAG_LSB_T, -MAG_RANGE_T), MAG_RANGE_T);
+        double gq = fmin(fmax(round(gyro[i] / GYRO_LSB_RAD_S) * GYRO_LSB_RAD_S, -GYRO_RANGE_RAD_S), GYRO_RANGE_RAD_S);
+        mag_body_f[i] = mag_bad ? NAN : (float)mq;
+        gyro_body_f[i] = gyro_bad ? NAN : (float)gq;
     }
+    /* body() takes raw sensor axes, so report what the hardware would: [U8, U9, U10] and gyro chip axes */
     mag_body_to_sensor(mag_body_f, in->magnetometer);
     gyro_body_to_sensor(gyro_body_f, in->gyro);
     for (int k = 0; k < NUM_DIODES; k++) in->photodiodes[k] = pd_bad[k] ? NAN : (float)pd[k];
@@ -408,8 +441,7 @@ void plant_sense(plant_t* p, plant_body_inputs_t* in) {
 }
 
 void plant_step(plant_t* p, const float* currents) {
-    err_model_t e;
-    error_model(p->cfg.worst_case, &e);
+    const err_model_t e = p->cfg.err;
 
     /* ---- actuators: currents -> dipole (scale factor, residual dipole, noise) -> torque ---- */
     double b_eci[3], b_body[3], dip[3], tq[3];
@@ -417,12 +449,14 @@ void plant_step(plant_t* p, const float* currents) {
     eci_to_body(p->q, b_eci, b_body);
     for (int i = 0; i < 3; i++) {
         double I = (currents != NULL && isfinite(currents[i])) ? currents[i] : 0.0;
+        if (p->t >= p->cfg.faults.coil_fault_t) I *= p->cfg.faults.coil_gain[i]; /* open / reversed coil */
+        p->coil_I[i] = I;
         dip[i] = (1.0 + e.sf_err[i]) * K_COIL[i] * I + e.m_res[i] + e.sigma_D * randn(p);
     }
     crossd(dip, b_body, tq);
     if (p->cfg.kick_on && p->t >= p->cfg.kick_t_s && p->t < p->cfg.kick_t_s + p->cfg.kick_len_s) {
         double Jdw[3];
-        matvec(J_SC, p->cfg.kick_dw, Jdw);
+        matvec(p->cfg.J, p->cfg.kick_dw, Jdw);
         for (int i = 0; i < 3; i++) tq[i] += Jdw[i] / p->cfg.kick_len_s;
     }
 
@@ -434,16 +468,16 @@ void plant_step(plant_t* p, const float* currents) {
     double h = PLANT_DT / nsub;
     for (int s = 0; s < nsub; s++) {
         double k1q[4], k1w[3], k2q[4], k2w[3], k3q[4], k3w[3], k4q[4], k4w[3], qt[4], wt[3];
-        att_deriv(p->q, p->w, tq, r_hat, n2, p->cfg.gravity_gradient, k1q, k1w);
+        att_deriv(p, p->q, p->w, tq, r_hat, n2, p->cfg.gravity_gradient, k1q, k1w);
         for (int i = 0; i < 4; i++) qt[i] = p->q[i] + 0.5 * h * k1q[i];
         for (int i = 0; i < 3; i++) wt[i] = p->w[i] + 0.5 * h * k1w[i];
-        att_deriv(qt, wt, tq, r_hat, n2, p->cfg.gravity_gradient, k2q, k2w);
+        att_deriv(p, qt, wt, tq, r_hat, n2, p->cfg.gravity_gradient, k2q, k2w);
         for (int i = 0; i < 4; i++) qt[i] = p->q[i] + 0.5 * h * k2q[i];
         for (int i = 0; i < 3; i++) wt[i] = p->w[i] + 0.5 * h * k2w[i];
-        att_deriv(qt, wt, tq, r_hat, n2, p->cfg.gravity_gradient, k3q, k3w);
+        att_deriv(p, qt, wt, tq, r_hat, n2, p->cfg.gravity_gradient, k3q, k3w);
         for (int i = 0; i < 4; i++) qt[i] = p->q[i] + h * k3q[i];
         for (int i = 0; i < 3; i++) wt[i] = p->w[i] + h * k3w[i];
-        att_deriv(qt, wt, tq, r_hat, n2, p->cfg.gravity_gradient, k4q, k4w);
+        att_deriv(p, qt, wt, tq, r_hat, n2, p->cfg.gravity_gradient, k4q, k4w);
         for (int i = 0; i < 4; i++) p->q[i] += h / 6.0 * (k1q[i] + 2 * k2q[i] + 2 * k3q[i] + k4q[i]);
         for (int i = 0; i < 3; i++) p->w[i] += h / 6.0 * (k1w[i] + 2 * k2w[i] + 2 * k3w[i] + k4w[i]);
         normalize_q(p->q);
@@ -453,7 +487,7 @@ void plant_step(plant_t* p, const float* currents) {
     if (p->cfg.gravity_gradient) {
         double rb[3], Jr[3], tg[3];
         eci_to_body(p->q, r_hat, rb);
-        matvec(J_SC, rb, Jr);
+        matvec(p->cfg.J, rb, Jr);
         crossd(rb, Jr, tg);
         for (int i = 0; i < 3; i++) tq[i] += 3.0 * n2 * tg[i];
     }

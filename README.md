@@ -18,17 +18,19 @@ limit), and a summary at the end. A failing check never stops the run; the exit 
 anything failed. Tests live in `src/test.c`.
 
 ### Known failing tests
-12 checks currently fail (357/369 pass). All 12 already failed before the sensor-frame change, on
-`c516e7f`, with identical values, so they are not caused by it. Not yet fixed:
+12 checks currently fail (383/395 pass). None are caused by the sensor-frame change (closed-loop plant
+sim runs are byte-identical before and after it). Not yet fixed:
 
 - `photodiode sun vector: NaN reading -> rejected`: a NaN photodiode reading is not rejected.
   This may be a real bug in `photodiode_determination.c` and needs a look.
-- 11 checks in `ADCS step (body.c)`. These look like stale tests rather than an algorithm problem:
+- `photodiodes: railed diode rejected every tick, ...`: the check still compares `pd_rejected`
+  as one number; it is now a per-diode array (`pd_rejected[NUM_DIODES]`), so the test needs updating.
+- 10 checks in `ADCS step (body.c)`. These look like stale tests rather than an algorithm problem:
   `body()` now waits `BODY_READY_TO_POINT_TICKS` (50) consecutive ready ticks before handing off
   from detumble to pointing, but the tests expect the hand-off after a single step.
   - Hand-off after one step: `low rates + sun visible -> switches to pointing`,
     `attitude is initialized`, `QUEST initial attitude error` (91 deg, measured against an attitude
-    QUEST never set), `transition step commands zero moment`.
+    QUEST never set).
   - Tick bookkeeping that assumes pointing started at tick 0: `ticks n through K command zero
     magnetic moment`, `predict-only ticks leave gyro bias unchanged`, `only measurement ticks make
     a meaningful gyro-bias correction`.

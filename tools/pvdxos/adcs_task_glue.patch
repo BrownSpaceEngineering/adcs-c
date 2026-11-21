@@ -1,0 +1,143 @@
+diff --git a/src/tasks/adcs/adcs_task.c b/src/tasks/adcs/adcs_task.c
+index eb5d065..ebf12af 100644
+--- a/src/tasks/adcs/adcs_task.c
++++ b/src/tasks/adcs/adcs_task.c
+@@ -42,9 +42,6 @@
+ #define ADCS_UTC_SAVE_PERIOD_S 60u
+ // A saved TLE older than this is not restored, since SGP4's error grows by around a km per day
+ #define ADCS_TLE_MAX_RESTORE_AGE_DAYS 14.0
+-// body() checks a TLE as soon as the sensors let it get that far, so a TLE that fails this many times is bad. It has
+-// to be dropped: body() gives up on any step where it is handed a bad TLE, which would stop pointing for good.
+-#define ADCS_TLE_MAX_ATTEMPTS 3
+ // The photodiodes have to agree on sunlight or eclipse for this many steps in a row (about 1 s) before it is reported,
+ // so that noise near the terminator doesn't flip the state machine's input back and forth
+ #define ADCS_SUNLIGHT_DEBOUNCE_STEPS 10
+@@ -73,9 +70,8 @@ static uint8_t sunlight_disagree_steps = 0;
+ 
+ static uint32_t last_utc_save_time = 0;
+ 
+-static adcs_tle_t pending_tle; // a TLE waiting for body() to accept it; only valid if tle_pending is set
++static adcs_tle_t pending_tle; // a TLE waiting for body() to look at it; only valid if tle_pending is set
+ static bool tle_pending = false;
+-static uint8_t tle_attempts = 0;
+ 
+ // Copied out by adcs_get_telemetry(), which runs on other tasks
+ static tel_adcs_data_t telemetry_snapshot;
+@@ -107,7 +103,6 @@ static status_t offer_tle(const adcs_tle_t *const tle) {
+ 
+     pending_tle = *tle;
+     tle_pending = true;
+-    tle_attempts = 0;
+     return SUCCESS;
+ }
+ 
+@@ -127,21 +122,21 @@ const float *adcs_get_tle_update(void) {
+     return tle_pending ? pending_tle.mean : NULL;
+ }
+ 
+-// Stops offering the pending TLE once body() has either accepted it or had enough chances to
+-static void resolve_pending_tle(const bool body_saw_tle) {
++// Stops offering the pending TLE once body() has looked at it. body() counts every TLE it accepts or rejects, so a
++// change in either counter across the body() call means it saw this one; if neither changed (e.g. it returned early on a
++// bad gyro sample while pointing) the TLE stays pending for the next step. A rejected TLE has used up its metadata in
++// body(), so it is dropped rather than retried: the ground resends the whole TLE (see tle_last_reject for why).
++static void resolve_pending_tle(const body_sensor_rejects_t *const before, const body_sensor_rejects_t *const after) {
+     if (!tle_pending) {
+         return;
+     }
+ 
+-    adcs_tle_t committed;
+-    const bool committed_valid = body_get_tle(committed.mean, &committed.bstar, &committed.epoch_jd);
+-    if (committed_valid && memcmp(committed.mean, pending_tle.mean, sizeof(committed.mean)) == 0 &&
+-        memcmp(&committed.epoch_jd, &pending_tle.epoch_jd, sizeof(committed.epoch_jd)) == 0) {
++    if (after->tle_accepted != before->tle_accepted) {
+         info("adcs: TLE accepted\n");
+         adcs_persist_save_tle(&pending_tle);
+         tle_pending = false;
+-    } else if (body_saw_tle && ++tle_attempts >= ADCS_TLE_MAX_ATTEMPTS) {
+-        warning("adcs: dropped a TLE that body() rejected\n");
++    } else if (after->tle_rejected != before->tle_rejected) {
++        warning("adcs: body() rejected the TLE (reason %u), dropped it\n", after->tle_last_reject);
+         tle_pending = false;
+     }
+ }
+@@ -293,21 +288,30 @@ void adcs_compute_currents(const float *const last_mag, const float *const mag,
+         int jd_scalar;
+         float jd_frac;
+ 
+-        if (adcs_get_time(&unix_time, &jd_scalar, &jd_frac) == SUCCESS) {
+-            body(last_mag, mag, gyro, photodiodes, adcs_get_tle_update(), unix_time, jd_scalar, jd_frac, dt, currents);
+-
+-            // body() bails before it looks at the TLE if the magnetometer or gyro readings are unusable
+-            const bool gyro_finite = isfinite(gyro[0]) && isfinite(gyro[1]) && isfinite(gyro[2]);
+-            resolve_pending_tle(gyro_finite && mag_usable(last_mag) && mag_usable(mag));
+-
+-            if (body_is_pointing()) {
+-                return;
+-            }
++        const bool have_time = adcs_get_time(&unix_time, &jd_scalar, &jd_frac) == SUCCESS;
++        if (!have_time) {
++            // Without UTC there is no orbit, so body() can't point, but it still runs B-dot (which only needs the
++            // magnetometer). A NAN time makes its orbit step fail cleanly (BODY_ORBIT_BAD_TIME), and any pending TLE
++            // waits until UTC is known.
++            unix_time = 0;
++            jd_scalar = 0;
++            jd_frac = NAN;
+         }
++
++        // static: the counters struct is a few hundred bytes, and the ADCS task's stack is tight (see adcs_task.h)
++        static body_sensor_rejects_t before;
++        static body_sensor_rejects_t after;
++        body_get_sensor_rejects(&before);
++        // body() handles every mode itself: B-dot detumbling (with its own coil quiet period, before the first TLE, and
++        // with a failed gyro), the hand-off, pointing, and falling back to B-dot on a fault. Its currents are used as is.
++        body(last_mag, mag, gyro, photodiodes, have_time ? adcs_get_tle_update() : NULL, unix_time, jd_scalar, jd_frac, dt,
++             currents);
++        body_get_sensor_rejects(&after);
++        resolve_pending_tle(&before, &after);
++        return;
+     }
+ 
+-    // Not pointing. body() may already have run this same B-dot, but it also gives up with zero currents for reasons
+-    // that don't stop B-dot (no TLE yet, a rejected TLE, a failed gyro read), and it can't tell us which happened.
++    // Detumble only: B-dot without body(), until the ground says otherwise
+     adcs_detumble(last_mag, mag, dt, currents);
+ }
+ 
+diff --git a/src/tasks/adcs/adcs_task.h b/src/tasks/adcs/adcs_task.h
+index 8c6ea8b..2e3595e 100644
+--- a/src/tasks/adcs/adcs_task.h
++++ b/src/tasks/adcs/adcs_task.h
+@@ -89,8 +89,8 @@ void adcs_tle_from_uplink(const tel_adcs_parameters_t *const params, adcs_tle_t
+ /**
+  * \fn get_adcs_do_point_command
+  *
+- * \brief Creates a command to run `body()` whenever possible, falling back to B-dot whenever it is not pointing.
+- *      This is the mode ADCS starts in.
++ * \brief Creates a command to run `body()` every step. `body()` detumbles with B-dot whenever it is not pointing
++ *      (including before the first TLE, without UTC, and with a failed gyro). This is the mode ADCS starts in.
+  *
+  * \warning any filter state left over from before a detumble-only period is reused, not reset; `body()`'s own
+  *      failure checks are what catch it if it has gone stale
+@@ -151,8 +151,8 @@ command_t get_adcs_set_utc_command(const uint32_t unix_time);
+  * \param gyro this step's angular rate in rad/s, in gyro chip axes (3 floats)
+  * \param photodiodes this step's photodiode readings (NUM_DIODES floats)
+  * \param dt time since the last step, in seconds
+- * \param currents buffer of 3 floats to fill with magnetorquer currents in Amps; zero if the magnetometer is unusable
+- *      and `body()` is not pointing
++ * \param currents buffer of 3 floats to fill with magnetorquer currents in Amps, as `body()` (or B-dot, in detumble
++ *      only mode) commands them
+  */
+ void adcs_compute_currents(const float *const last_mag, const float *const mag, const float *const gyro, const float *const photodiodes,
+                            const float dt, float *const currents);
+@@ -223,8 +223,8 @@ void adcs_update_sunlight(const float *const photodiodes, const bool photodiodes
+ /**
+  * \fn adcs_get_tle_update
+  *
+- * \brief Gets the TLE to hand to `body()` if there is a new one, which stays pending until `body()` accepts it or
+- *      has rejected it too many times
++ * \brief Gets the TLE to hand to `body()` if there is a new one, which stays pending until `body()` has accepted or
++ *      rejected it (a rejected TLE is dropped; the ground has to resend it with its metadata)
+  *
+  * \returns pointer to 6 TLE mean elements [n (rev/day), e, i, RAAN, argp, M (rad)], or NULL to reuse the last TLE
+  */

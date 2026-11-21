@@ -34,6 +34,28 @@
 
 #define PLANT_DT 0.1 /* s, FSW tick (body() rate) */
 
+/* Sensor / actuator / ground error model (Simulink "Sensors (noise)" + "ADCS_Actuators") */
+typedef struct {
+    double sigma_mag, mag_bias[3];                    /* T */
+    double gyro_bias0[3], sigma_rrw, sigma_gyro[3];   /* rad/s, rad/s/sqrt(s), rad/s per sample */
+    double sigma_pd, pd_spread, albedo;               /* raw, +- fraction, reflectance */
+    double sf_err[3], m_res[3], sigma_D;              /* coil scale-factor error, residual dipole A m^2, noise */
+    double uplink_period_s, sigma_at_s;               /* TLE uplink period, along-track timing error (s) */
+} plant_errors_t;
+
+/* Fault injection (all off by default) */
+typedef struct {
+    double spike_t0, spike_t1;        /* s, window for random spikes */
+    double mag_spike_p, gyro_spike_p; /* probability per tick of a spike on one axis */
+    double mag_bias_step_t;           /* s, from this time on add mag_bias_step (T); Inf = off */
+    double mag_bias_step[3];
+    double coil_fault_t;              /* s, from this time on multiply coil currents by coil_gain */
+    double coil_gain[3];              /* 1 = healthy, 0 = open coil, -1 = reversed polarity */
+    double gyro_dead_t0, gyro_dead_t1; /* s, gyro outputs NaN in [t0, t1) (dead part / driver) */
+    double clock_jump_t0, clock_jump_t1; /* s, flight clock off by clock_jump_days in [t0, t1) */
+    double clock_jump_days;
+} plant_faults_t;
+
 typedef struct {
     /* Initial orbit: TLE mean elements in body() posn_update order, B* and epoch (UTC JD) */
     float tle_mean[6];
@@ -50,9 +72,20 @@ typedef struct {
     bool nan_dropouts;              /* sensor NaN fault injection (Simulink default: on) */
     bool gravity_gradient;          /* Spacecraft Dynamics useGravGrad (Simulink: on) */
 
+    /* Coil -> magnetometer coupling (T per A): the magnetometer reads B + K * I, where I are the coil
+     * currents applied since the previous tick (body() reads sensors before it commands). Zero by
+     * default; hardware tests show it is small, so set it from the measured value. */
+    double mag_coil_coupling[3][3];
+
     /* Tumble kick (ADCS_Actuators): adds J * kick_dw / kick_len torque for kick_len s */
     bool kick_on;
     double kick_t_s, kick_len_s, kick_dw[3];
+
+    /* Truth parameters (plant_default_config: Simulink values; Monte Carlo overrides these).
+     * err follows worst_case only through plant_error_model(): set it after changing worst_case. */
+    double J[3][3];                 /* kg m^2, body axes */
+    plant_errors_t err;
+    plant_faults_t faults;
 } plant_config_t;
 
 /* Exactly the arguments body() takes for one tick (plus the TLE metadata call). */
@@ -92,6 +125,8 @@ typedef struct {
     double r[3], v[3];              /* m, m/s, GCRF */
     double q[4], w[3];              /* body->ECI, rad/s */
     double torque[3];
+    double Jinv[3][3];
+    double coil_I[3];               /* A, currents applied over the current tick (for the coupling) */
     /* sensor state */
     double gyro_bias[3];
     float prev_mag[3];
@@ -110,6 +145,8 @@ typedef struct {
 
 /* Fills cfg with the Simulink defaults (nominal, dropouts on, GG on, kick off, rest at identity) */
 void plant_default_config(plant_config_t* cfg);
+/* The Simulink nominal (0) / worst-case (1) error model */
+void plant_error_model(int worst_case, plant_errors_t* e);
 /* Returns 0 on success, -1 if the TLE can't be initialised / propagated to start_jd */
 int plant_init(plant_t* p, const plant_config_t* cfg);
 /* Sample the sensors / clock / uplink at the current truth state -> body() inputs */

@@ -2,9 +2,18 @@
 #define NEWPOINTING_H
 #include <stdbool.h>
 
-// Gains / limits from the MATLAB nadir-pointing fcn
-#define NEW_PD_KP 2e4f
-#define NEW_PD_KD 1.5e5f
+// Gains / limits. The MATLAB nadir-pointing fcn used kp = 2e4, kd = 1.5e5. Chosen from a host Monte
+// Carlo over the full uncertainty envelope (tools/mc: inertia +-20% / 10 deg, orbit, tip-off, sensor,
+// coil errors; 200 runs each, 6 orbits), settled nadir p95 median / P90 and runs with p95 <= 10 deg:
+//   kp 2e4 kd 1.5e5: 14.7 / 38.2 deg, 46/187      kp 4e4 kd 3e5: 9.8 / 28.7 deg, 96/187
+//   kp 8e4 kd 6e5  : 11.1 / 59.5 deg, 87/187 (best with only sensor noise varied, but an instability
+//   tail for some inertia / orbit combinations).
+#ifndef NEW_PD_KP
+#define NEW_PD_KP 4e4f
+#endif
+#ifndef NEW_PD_KD
+#define NEW_PD_KD 3e5f
+#endif
 extern const float NEW_PD_MAX_DIPOLE[3]; // A*m^2, per body axis
 
 /**
