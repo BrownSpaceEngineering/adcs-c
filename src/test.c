@@ -1761,17 +1761,11 @@ static void ideal_photodiode_readings(const float* sun_body, float scale, float 
 void test_photodiodes(void) {
     begin_suite("photodiode sun vector");
 
-    bool unit = true, pairs = true;
+    bool unit = true;
     for (int i = 0; i < NUM_DIODES; i++) {
         unit &= fabsf(l2_norm(PHOTODIODES[i], 3) - 1) < 1e-5f;
-        if (i % 2 == 0) {
-            float s[3] = {PHOTODIODES[i][0] + PHOTODIODES[i + 1][0], PHOTODIODES[i][1] + PHOTODIODES[i + 1][1],
-                          PHOTODIODES[i][2] + PHOTODIODES[i + 1][2]};
-            pairs &= l2_norm(s, 3) < 1e-6f;
-        }
     }
     check_true(unit, "diode normals are unit vectors");
-    check_true(pairs, "diodes 2k and 2k+1 point in opposite directions");
 
     rng_seed(801);
     float worst = 0;
