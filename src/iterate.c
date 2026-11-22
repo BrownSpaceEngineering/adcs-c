@@ -299,10 +299,37 @@ static void gradient_descent(const float32_t* quat_sigmas, const float32_t* x0, 
     }
 }
 
+// 3x3 inverse by cofactors; false if (near-)singular
+static bool inv3(const float* A, float* Ai) {
+    float c00 = A[4] * A[8] - A[5] * A[7], c01 = A[5] * A[6] - A[3] * A[8], c02 = A[3] * A[7] - A[4] * A[6];
+    float det = A[0] * c00 + A[1] * c01 + A[2] * c02;
+    if (!(fabsf(det) > 1e-30f) || !isfinite(det)) return false;
+    float id = 1.0f / det;
+    Ai[0] = c00 * id;
+    Ai[1] = (A[2] * A[7] - A[1] * A[8]) * id;
+    Ai[2] = (A[1] * A[5] - A[2] * A[4]) * id;
+    Ai[3] = c01 * id;
+    Ai[4] = (A[0] * A[8] - A[2] * A[6]) * id;
+    Ai[5] = (A[2] * A[3] - A[0] * A[5]) * id;
+    Ai[6] = c02 * id;
+    Ai[7] = (A[1] * A[6] - A[0] * A[7]) * id;
+    Ai[8] = (A[0] * A[4] - A[1] * A[3]) * id;
+    return true;
+}
+
 ukf_status_t iterate(const float* error_state, const float* quat_state, const float* cov,
                      const float* body, const float* ref, int num_vecs, const float* gyro,
                      const float* Q, const float* R, float dt, float* new_err_state,
                      float* new_quat_state, float* new_P) {
+    return iterate_gated(error_state, quat_state, cov, body, ref, num_vecs, gyro, Q, R, dt, INFINITY,
+                         new_err_state, new_quat_state, new_P, NULL);
+}
+
+ukf_status_t iterate_gated(const float* error_state, const float* quat_state, const float* cov,
+                           const float* body, const float* ref, int num_vecs, const float* gyro,
+                           const float* Q, const float* R, float dt, float gate, float* new_err_state,
+                           float* new_quat_state, float* new_P, unsigned int* rejected_mask) {
+    if (rejected_mask != NULL) *rejected_mask = 0u;
     // Copy inputs first so outputs may alias them, and so failures can return the inputs
     float x_in[STATE_SIZE];
     float q_in[4];
@@ -323,7 +350,7 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
         || !all_finite(q_in, 4) || !all_finite(gyro, 3) || !all_finite(Q, STATE_SIZE * STATE_SIZE)) {
         UKF_FAIL(UKF_ERR_ARGS);
     }
-    const int m = 3 * num_vecs;
+    int m = 3 * num_vecs; // shrinks to the kept components after the innovation gate
     if (num_vecs > 0 && (!all_finite(body, m) || !all_finite(ref, m) || !all_finite(R, m * m))) {
         UKF_FAIL(UKF_ERR_ARGS);
     }
@@ -425,10 +452,55 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
         }
 
         // P_vv = P_zz + R
-        float P_vv[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
+        float P_vv_full[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
         for (int i = 0; i < m * m; i++) {
-            P_vv[i] = P_zz[i] + R[i];
+            P_vv_full[i] = P_zz[i] + R[i];
         }
+
+        // Innovation gate: drop any vector whose normalized innovation squared
+        // d2 = nu' S^-1 nu (S = its 3x3 block of P_vv) exceeds `gate`. Keeping a sub-block of the
+        // statistics is exactly the update with only the kept vectors.
+        int keep[MAX_MSMT_SIZE];
+        int mk = 0;
+        for (int v = 0; v < num_vecs; v++) {
+            bool ok = true;
+            if (isfinite(gate)) {
+                float S3[9], S3i[9], nu3[3];
+                for (int a = 0; a < 3; a++) {
+                    nu3[a] = body[3 * v + a] - mean_measurement[3 * v + a];
+                    for (int b = 0; b < 3; b++) S3[a * 3 + b] = P_vv_full[(3 * v + a) * m + 3 * v + b];
+                }
+                if (inv3(S3, S3i)) {
+                    float d2 = 0.0f;
+                    for (int a = 0; a < 3; a++) {
+                        for (int b = 0; b < 3; b++) d2 += nu3[a] * S3i[a * 3 + b] * nu3[b];
+                    }
+                    ok = d2 <= gate;
+                }
+            }
+            if (ok) {
+                for (int a = 0; a < 3; a++) keep[mk++] = 3 * v + a;
+            } else if (rejected_mask != NULL) {
+                *rejected_mask |= 1u << v;
+            }
+        }
+        if (mk == 0) {
+            // every vector gated out: predict only
+            memcpy(x_hat, mean_error, sizeof(x_hat));
+            memcpy(P, P_hat, sizeof(P));
+            goto finish;
+        }
+        // Compress to the kept components (identity when nothing was gated)
+        float P_vv[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
+        float body_k[MAX_MSMT_SIZE], mean_k[MAX_MSMT_SIZE];
+        float P_xz_k[STATE_SIZE * MAX_MSMT_SIZE];
+        for (int a = 0; a < mk; a++) {
+            body_k[a] = body[keep[a]];
+            mean_k[a] = mean_measurement[keep[a]];
+            for (int b = 0; b < mk; b++) P_vv[a * mk + b] = P_vv_full[keep[a] * m + keep[b]];
+            for (int r = 0; r < STATE_SIZE; r++) P_xz_k[r * mk + a] = P_xz[r * m + keep[a]];
+        }
+        m = mk;
 
         // k = P_xz * inv(P_vv). arm_mat_inverse_f32 destroys its input, so invert a copy.
         float P_vv_scratch[MAX_MSMT_SIZE * MAX_MSMT_SIZE];
@@ -441,7 +513,7 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
             UKF_FAIL(UKF_ERR_SINGULAR);
         }
         float K[STATE_SIZE * MAX_MSMT_SIZE];
-        arm_matrix_instance_f32 P_xz_mat = {STATE_SIZE, (uint16_t)m, P_xz};
+        arm_matrix_instance_f32 P_xz_mat = {STATE_SIZE, (uint16_t)m, P_xz_k};
         arm_matrix_instance_f32 K_mat = {STATE_SIZE, (uint16_t)m, K};
         arm_mat_mult_f32(&P_xz_mat, &P_vv_inv_mat, &K_mat);
 
@@ -449,7 +521,7 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
         for (int r = 0; r < STATE_SIZE; r++) {
             float corr = 0.0f;
             for (int c = 0; c < m; c++) {
-                corr += K[r * m + c] * (body[c] - mean_measurement[c]);
+                corr += K[r * m + c] * (body_k[c] - mean_k[c]);
             }
             x_hat[r] = mean_error[r] + corr;
         }
@@ -480,6 +552,7 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
         memcpy(P, P_hat, sizeof(P));
     }
 
+finish:
     // P = ensure_positive_definite(P);
     if (!ensure_psd(P, STATE_SIZE)) {
         UKF_FAIL(UKF_ERR_CHOLESKY);

@@ -55,6 +55,17 @@ ukf_status_t iterate(const float* error_state, const float* quat_state, const fl
                      const float* Q, const float* R, float dt, float* new_err_state,
                      float* new_quat_state, float* new_P);
 
+/**
+ * iterate() with an innovation gate: each measured vector whose normalized innovation squared
+ * nu' S^-1 nu (S = its 3x3 block of the innovation covariance) exceeds `gate` is left out of the
+ * update (all gated out = predict only). gate = INFINITY disables it (that is iterate()).
+ * rejected_mask (may be NULL): bit v set if vector v was gated out.
+ */
+ukf_status_t iterate_gated(const float* error_state, const float* quat_state, const float* cov,
+                           const float* body, const float* ref, int num_vecs, const float* gyro,
+                           const float* Q, const float* R, float dt, float gate, float* new_err_state,
+                           float* new_quat_state, float* new_P, unsigned int* rejected_mask);
+
 // Internal steps, exposed for unit testing
 float32_t calculate_lambda(int n, float32_t alpha, float32_t kappa);
 void get_weights(float32_t lambda, int n, float32_t alpha, float32_t beta, float32_t* cov_weights,
