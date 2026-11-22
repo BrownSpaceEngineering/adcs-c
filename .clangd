@@ -1,3 +1,7 @@
+CompileFlags:
+  CompilationDatabase: build
+
+---
 # Editor-only flags for the MATLAB MEX wrappers in test/ (not in CMake's compile_commands.json).
 # mex adds these itself when building; this just lets clangd find mex.h.
 If:
