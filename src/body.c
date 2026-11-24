@@ -155,6 +155,8 @@ static void reset_bdot_cycle(void) {
     memset(bdot_moment, 0, sizeof(bdot_moment));
 }
 
+static void magcal_reset(void);
+
 void body_reset(void) {
     memset(tle_mean, 0, sizeof(tle_mean));
     tle_bstar = 0.0;
@@ -196,15 +198,12 @@ void body_reset(void) {
     gyro_step_ticks = 0;
     gate_streak = 0;
     memset(&rejects, 0, sizeof(rejects));
-    memset(magcal_b, 0, sizeof(magcal_b));
-    memset(magcal_P, 0, sizeof(magcal_P));
-    for (int i = 0; i < 3; i++) magcal_P[4 * i] = BODY_MAGCAL_P0_UT2;
-    magcal_n = 0;
-    magcal_ticks = BODY_MAGCAL_MIN_TICKS;
+    magcal_reset();
     for (int i = 0; i < 3; i++) {
         coil_sign[i] = 1.0f;
         coil_enabled[i] = true;
     }
+    sensor_maps_reset();
 }
 
 void body_get_sensor_rejects(body_sensor_rejects_t* out) { *out = rejects; }
@@ -261,7 +260,8 @@ static void command_zero_moment(float* output_currents) {
     moment2current3axis(ZERO3, Imax, output_currents);
 }
 
-static void reset_filter_to_detumble(void) {
+// Drop the attitude estimate and go back to detumbling, without counting it as a divergence
+static void clear_filter_state(void) {
     memset(estimated_quat, 0, sizeof(estimated_quat));
     estimated_quat[0] = 1.0f;
     memset(estimated_gyro_bias, 0, sizeof(estimated_gyro_bias));
@@ -277,7 +277,21 @@ static void reset_filter_to_detumble(void) {
     ready_ticks = 0;
     dbdt_filt_valid = false;
     reset_bdot_cycle();
+}
+
+// The filter failed: drop it and count the reset
+static void reset_filter_to_detumble(void) {
+    clear_filter_state();
     filter_resets++;
+}
+
+// Forget the hard-iron estimate and start the calibration over
+static void magcal_reset(void) {
+    memset(magcal_b, 0, sizeof(magcal_b));
+    memset(magcal_P, 0, sizeof(magcal_P));
+    for (int i = 0; i < 3; i++) magcal_P[4 * i] = BODY_MAGCAL_P0_UT2;
+    magcal_n = 0;
+    magcal_ticks = BODY_MAGCAL_MIN_TICKS;
 }
 
 // Largest angle between a measured body vector and the one predicted by q_body_to_ref
@@ -506,6 +520,52 @@ void body_get_coil_config(float* sign, bool* enabled) {
     for (int i = 0; i < 3; i++) {
         if (sign != NULLPTR) sign[i] = coil_sign[i];
         if (enabled != NULLPTR) enabled[i] = coil_enabled[i];
+    }
+}
+
+/* ---------------- sensor -> body maps (from the ground) ---------------- */
+static bool same_map(const sensor_axis_map_t* a, const sensor_axis_map_t* b) {
+    for (int i = 0; i < 3; i++) {
+        if (a->axis[i] != b->axis[i] || (a->sign[i] < 0.0f) != (b->sign[i] < 0.0f)) return false;
+    }
+    return true;
+}
+
+bool body_set_sensor_maps(const int8_t* mag_codes, const int8_t* gyro_codes) {
+    sensor_axis_map_t mag_old, gyro_old, mag_new, gyro_new;
+    mag_get_sensor_map(&mag_old);
+    gyro_get_sensor_map(&gyro_old);
+    mag_new = mag_old;
+    gyro_new = gyro_old;
+
+    // Validate everything before changing anything: a bad uplink leaves both maps as they were
+    if (mag_codes != NULLPTR && !sensor_map_from_codes(mag_codes, &mag_new)) return false;
+    if (gyro_codes != NULLPTR && (!sensor_map_from_codes(gyro_codes, &gyro_new) || !(sensor_map_det(&gyro_new) > 0.0f))) {
+        return false;
+    }
+    const bool mag_changed = !same_map(&mag_new, &mag_old);
+    const bool gyro_changed = !same_map(&gyro_new, &gyro_old);
+    if (!mag_changed && !gyro_changed) return true; // re-applying the same maps (e.g. after a reboot) disturbs nothing
+
+    mag_set_sensor_map(&mag_new);   // both already validated, so these can't fail
+    gyro_set_sensor_map(&gyro_new);
+
+    // The attitude estimate, gyro bias and dB/dt history were all built in the old frames
+    clear_filter_state();
+    // The hard-iron estimate lives in body axes, so it's wrong once the magnetometer map changes
+    if (mag_changed) magcal_reset();
+    return true;
+}
+
+void body_get_sensor_maps(int8_t* mag_codes, int8_t* gyro_codes) {
+    sensor_axis_map_t m;
+    if (mag_codes != NULLPTR) {
+        mag_get_sensor_map(&m);
+        sensor_map_to_codes(&m, mag_codes);
+    }
+    if (gyro_codes != NULLPTR) {
+        gyro_get_sensor_map(&m);
+        sensor_map_to_codes(&m, gyro_codes);
     }
 }
 

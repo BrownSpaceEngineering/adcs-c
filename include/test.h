@@ -27,6 +27,7 @@ void test_pointing(void);
 void test_filters(void);
 void test_sensor_frames(void);
 void test_body(void);
+void test_sensor_map_uplink(void);
 void test_fault_protection(void);
 // Compares against include/matlab_reference.h (tools/matlab/generate_matlab_reference.m)
 void test_matlab_parity(void);
