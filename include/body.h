@@ -184,6 +184,10 @@ bool body_is_detumble_only(void);
 // Current body->ECI estimate; returns false if the attitude hasn't been initialized
 bool body_get_attitude(float* q_body_to_eci);
 void body_get_gyro_bias(float* bias);
+// Diagonal of the attitude filter's error covariance: attitude error variances (rad^2, global/ECI error
+// rotation vector), then gyro bias variances ((rad/s)^2). All zero, and returns false, while the attitude
+// hasn't been initialized (detumbling, or after a filter reset)
+bool body_get_covariance_diag(float* diag6);
 // Number of times the filter has been declared failed and reset to detumbling
 int body_get_filter_resets(void);
 /* Apply B* and UTC epoch to the next non-NULL posn_update; consumed once. */

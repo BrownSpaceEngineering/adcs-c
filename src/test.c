@@ -2500,6 +2500,17 @@ void test_body(void) {
     check_less("predict-only ticks leave gyro bias unchanged", max_predict_bias_step, 1e-5);
     check_true(max_update_bias_step > max_predict_bias_step,
                "only measurement ticks make a meaningful gyro-bias correction");
+    {
+        float diag[6];
+        bool init = body_get_covariance_diag(diag);
+        bool positive = true, shrunk = true;
+        for (int i = 0; i < 6; i++) {
+            positive &= isfinite(diag[i]) && diag[i] > 0.0f;
+            shrunk &= diag[i] < INIT_P[i * 6 + i];
+        }
+        check_true(init && positive, "sunlit: covariance diagonal is finite and positive");
+        check_true(shrunk, "sunlit: covariance diagonal shrank below its initial value");
+    }
 
     // Eclipse for 15 minutes: magnetometer-only filtering keeps us close
     float worst = 0;
@@ -2551,6 +2562,13 @@ void test_body(void) {
     body_sim_bad_mag_step(&s, zero_mag, NULLPTR, true, false, currents);
     check_true(!body_is_pointing() && !body_get_attitude(q_dummy) && body_get_filter_resets() == 1,
                "persistent bad magnetometer: filter resets once at the limit");
+    {
+        float diag[6];
+        bool init = body_get_covariance_diag(diag);
+        bool all_zero = true;
+        for (int i = 0; i < 6; i++) all_zero &= diag[i] == 0.0f;
+        check_true(!init && all_zero, "filter reset: covariance diagonal reads all zero, not initialized");
+    }
     body_sim_step(&s, true, 1, currents);
     check_true(body_is_pointing(), "valid magnetometer after a persistent fault resumes pointing");
 

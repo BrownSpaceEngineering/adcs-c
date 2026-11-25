@@ -253,6 +253,13 @@ bool body_get_attitude(float* q_body_to_eci) {
 
 void body_get_gyro_bias(float* bias) { memcpy(bias, estimated_gyro_bias, sizeof(estimated_gyro_bias)); }
 
+bool body_get_covariance_diag(float* diag6) {
+    for (int i = 0; i < 6; i++) {
+        diag6[i] = error_quat_cov[i * 6 + i]; // row-major 6x6: diagonal at 0, 7, 14, 21, 28, 35
+    }
+    return attitude_initialized;
+}
+
 int body_get_filter_resets(void) { return filter_resets; }
 
 static void zero_currents(float* output_currents) { memcpy(output_currents, ZERO3, sizeof(ZERO3)); }
