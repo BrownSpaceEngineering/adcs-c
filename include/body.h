@@ -78,6 +78,18 @@ bool body_get_mag_bias(float* bias_T);
 void body_set_coil_config(const float* sign, const bool* enabled);
 void body_get_coil_config(float* sign, bool* enabled);
 
+/* ---- Sensor -> body maps ----
+ * Replace the magnetometer and/or gyro axis maps from the ground (a sensor found mounted or wired the
+ * wrong way after launch). Codes are int8[3], one per body axis: +-1 / +-2 / +-3 = +- sensor x / y / z
+ * (see sensor_frames.h); NULL leaves that sensor's map alone. Both are validated before either changes:
+ * returns false, changing nothing, unless each names every sensor axis once and the gyro map is a
+ * proper rotation (det +1). A real change drops the attitude estimate back to detumbling (not counted
+ * in body_get_filter_resets()), and a magnetometer change also restarts the hard-iron calibration.
+ * Re-applying the current maps changes nothing. NOTE: body_reset() restores the as-built maps, so
+ * flight software must re-apply stored maps after every reset, as for the coil configuration. */
+bool body_set_sensor_maps(const int8_t* mag_codes, const int8_t* gyro_codes);
+void body_get_sensor_maps(int8_t* mag_codes, int8_t* gyro_codes);
+
 /* Orbit / TLE status codes (tle_last_reject, orbit_fail_reason) */
 #define BODY_ORBIT_OK 0u
 #define BODY_ORBIT_NO_METADATA 1u    /* uplink: elements without fresh body_set_tle_metadata */

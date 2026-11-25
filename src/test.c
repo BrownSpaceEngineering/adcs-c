@@ -284,6 +284,7 @@ int test_run_all(void) {
     test_filters();
     test_sensor_frames();
     test_body();
+    test_sensor_map_uplink();
     test_fault_protection();
     test_matlab_parity();
 
@@ -2001,6 +2002,33 @@ void test_sensor_frames(void) {
     gyro_body_to_sensor(out, back);
     check_vec_close("gyro sensor -> body -> sensor is exact", back, raw, 3, 0);
 
+    {
+        int8_t codes[3];
+        sensor_axis_map_t m;
+        const int8_t mag_codes[3] = {1, 2, -3}, gyro_codes[3] = {-2, -1, -3};
+        sensor_map_to_codes(&MAG_SENSOR_TO_BODY, codes);
+        check_true(memcmp(codes, mag_codes, 3) == 0, "magnetometer as-built map encodes as {1, 2, -3}");
+        sensor_map_to_codes(&GYRO_SENSOR_TO_BODY, codes);
+        check_true(memcmp(codes, gyro_codes, 3) == 0, "gyro as-built map encodes as {-2, -1, -3}");
+        bool round_trip = true;
+        int valid = 0, rotations = 0;
+        for (int a = -3; a <= 3; a++) {
+            for (int b = -3; b <= 3; b++) {
+                for (int c = -3; c <= 3; c++) {
+                    const int8_t in[3] = {(int8_t)a, (int8_t)b, (int8_t)c};
+                    if (!sensor_map_from_codes(in, &m)) continue;
+                    valid++;
+                    rotations += sensor_map_det(&m) > 0.0f;
+                    sensor_map_to_codes(&m, codes);
+                    round_trip &= memcmp(codes, in, 3) == 0 && is_signed_permutation(&m);
+                }
+            }
+        }
+        check_true(valid == 48 && rotations == 24, "exactly 48 valid codes (24 rotations, 24 reflections)");
+        check_true(round_trip, "every valid code decodes to a signed permutation and encodes back to itself");
+        check_true(sensor_map_det(&MAG_SENSOR_TO_BODY) < 0.0f && sensor_map_det(&GYRO_SENSOR_TO_BODY) > 0.0f,
+                   "sensor_map_det: magnetometer -1 (reflection), gyro +1");
+    }
     check_true(is_signed_permutation(&MAG_SENSOR_TO_BODY), "magnetometer map is a signed permutation (orthonormal)");
     check_true(is_signed_permutation(&GYRO_SENSOR_TO_BODY), "gyro map is a signed permutation (orthonormal)");
     // A single 3-axis gyro chip can't be mirrored: its map must be a proper rotation
@@ -2131,6 +2159,97 @@ static float body_attitude_error_deg(const body_sim_t* s) {
     float q[4];
     body_get_attitude(q);
     return RAD2DEG(quat_angle_between(q, s->q_true));
+}
+
+// Ground-commanded sensor -> body maps (body_set_sensor_maps)
+void test_sensor_map_uplink(void) {
+    begin_suite("sensor map uplink");
+    const int8_t mag_built[3] = {1, 2, -3}, gyro_built[3] = {-2, -1, -3};
+    int8_t mag_codes[3], gyro_codes[3];
+    float currents[3];
+
+    body_reset();
+    body_get_sensor_maps(mag_codes, gyro_codes);
+    check_true(memcmp(mag_codes, mag_built, 3) == 0 && memcmp(gyro_codes, gyro_built, 3) == 0,
+               "after body_reset the active maps are the as-built ones");
+
+    // Bad uplinks change nothing, and a bad gyro map also blocks a good magnetometer map in the same call
+    const int8_t dup[3] = {1, 1, 3}, zero_code[3] = {0, 2, 3}, too_big[3] = {4, 2, 3}, flip_z[3] = {1, 2, 3};
+    const int8_t gyro_mirror[3] = {-1, -2, -3}; // det -1
+    check_true(!body_set_sensor_maps(dup, NULLPTR), "magnetometer map naming an axis twice is rejected");
+    check_true(!body_set_sensor_maps(zero_code, NULLPTR), "code 0 is rejected");
+    check_true(!body_set_sensor_maps(too_big, NULLPTR), "code 4 is rejected");
+    check_true(!body_set_sensor_maps(NULLPTR, gyro_mirror), "mirrored (det -1) gyro map is rejected");
+    check_true(!body_set_sensor_maps(flip_z, zero_code), "valid magnetometer + invalid gyro map is rejected as a whole");
+    body_get_sensor_maps(mag_codes, gyro_codes);
+    check_true(memcmp(mag_codes, mag_built, 3) == 0 && memcmp(gyro_codes, gyro_built, 3) == 0,
+               "rejected uplinks left both maps unchanged");
+
+    // Point first, then uplink a (wrong) magnetometer map
+    body_sim_t s;
+    rng_seed(902);
+    body_sim_init(&s);
+    s.omega[0] = 0.002f;
+    s.omega[1] = -0.001f;
+    s.omega[2] = 0.0015f;
+    body_reset();
+    {
+        float m0[3], g0[3], d0[NUM_DIODES];
+        body_sim_sensors(&s, true, m0, g0, d0);
+        memcpy(s.last_mag, m0, sizeof(m0));
+    }
+    for (int k = 0; k < 300; k++) body_sim_step(&s, true, 1, currents);
+    check_true(body_is_pointing(), "setup: pointing before the uplink");
+    for (int k = 0; k < 20000 && !body_get_mag_bias(currents); k++) body_sim_step(&s, true, 1, currents);
+    const bool magcal_was_ready = body_get_mag_bias(currents);
+
+    // Re-applying the current maps (what flight software does after every reboot) disturbs nothing
+    check_true(body_set_sensor_maps(mag_built, gyro_built), "re-applying the current maps is accepted");
+    float q_dummy[4];
+    check_true(body_is_pointing() && body_get_attitude(q_dummy), "re-applying the current maps keeps pointing");
+    check_true(body_get_mag_bias(currents) == magcal_was_ready, "re-applying the current maps keeps the hard-iron estimate");
+
+    const int resets_before = body_get_filter_resets();
+    check_true(body_set_sensor_maps(flip_z, NULLPTR), "valid magnetometer map is accepted");
+    body_get_sensor_maps(mag_codes, gyro_codes);
+    check_true(memcmp(mag_codes, flip_z, 3) == 0 && memcmp(gyro_codes, gyro_built, 3) == 0,
+               "new magnetometer map is active; gyro map untouched (NULL)");
+    check_true(!body_is_pointing() && !body_get_attitude(q_dummy), "a map change drops the attitude estimate (back to detumbling)");
+    check_true(body_get_filter_resets() == resets_before, "a commanded map change is not counted as a filter divergence");
+    check_true(magcal_was_ready && !body_get_mag_bias(currents), "a magnetometer map change restarts the hard-iron calibration");
+
+    // Only the flight path changed: the simulated hardware still reads with the as-built wiring
+    const float raw[3] = {1.0f, 2.0f, 3.0f}, body_v[3] = {1.0f, 2.0f, 3.0f};
+    float out[3];
+    mag_sensor_to_body(raw, out);
+    const float flight_expected[3] = {1.0f, 2.0f, 3.0f};
+    check_vec_close("flight path uses the uplinked map: (1,2,3) -> body (1,2,3)", out, flight_expected, 3, 0);
+    mag_body_to_sensor(body_v, out);
+    const float hw_expected[3] = {1.0f, 2.0f, -3.0f};
+    check_vec_close("hardware model keeps the as-built map: body (1,2,3) -> sensor (1,2,-3)", out, hw_expected, 3, 0);
+
+    // With the wrong map the magnetometer disagrees with the field model: note how it does, then restore
+    float worst_wrong = 0.0f;
+    for (int k = 0; k < 600; k++) {
+        body_sim_step(&s, true, 1, currents);
+        if (body_get_attitude(q_dummy)) worst_wrong = fmaxf(worst_wrong, body_attitude_error_deg(&s));
+    }
+    printf("  [NOTE] wrong magnetometer map, 600 s sunlit: worst attitude error %.1f deg, pointing %d, filter resets %d\n",
+           (double)worst_wrong, body_is_pointing(), body_get_filter_resets() - resets_before);
+    notes++;
+
+    check_true(body_set_sensor_maps(mag_built, NULLPTR), "restoring the as-built magnetometer map is accepted");
+    float tail = 0.0f;
+    for (int k = 0; k < 900; k++) {
+        body_sim_step(&s, true, 1, currents);
+        if (k >= 700) tail += body_attitude_error_deg(&s);
+    }
+    check_true(body_is_pointing(), "after restoring the map: pointing again");
+    check_less("after restoring the map: mean attitude error over the last 200 s (deg)", tail / 200, 1.5);
+
+    body_reset();
+    body_get_sensor_maps(mag_codes, gyro_codes);
+    check_true(memcmp(mag_codes, mag_built, 3) == 0, "body_reset restores the as-built maps");
 }
 
 void test_fault_protection(void) {
